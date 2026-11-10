@@ -1,0 +1,39 @@
+syntax = "proto3";
+package neuro.v1;
+
+option go_package = "github.com/neurohalo/neurohalo/gen/neuro/v1;neurov1";
+
+// Every data source sends this one format over a client-streaming call.
+// A header comes first, then batches.
+
+message SessionHeader {
+  string session_id = 1;
+  double sample_rate_hz = 2;
+  repeated string channel_names = 3;   // standard names, e.g. "Fp1", "Cz"
+  string source = 4;                   // e.g. "replayer"
+}
+
+message SampleBatch {
+  string session_id = 1;
+  uint64 seq = 2;                      // starts at 0, +1 per batch
+  uint64 first_sample_index = 3;       // position in the session
+  int64 sent_time_unix_nanos = 4;      // wall clock when the sender sent it
+  uint32 num_samples = 5;
+  repeated float values = 6;           // num_samples x channels, row by row, microvolts
+}
+
+message IngestRequest {
+  oneof msg {
+    SessionHeader header = 1;
+    SampleBatch batch = 2;
+  }
+}
+
+message IngestSummary {
+  uint64 batches_received = 1;
+  uint64 last_seq = 2;
+}
+
+service Ingest {
+  rpc Stream(stream IngestRequest) returns (IngestSummary);
+}

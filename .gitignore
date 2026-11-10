@@ -1,0 +1,16 @@
+# Recordings are downloaded, not committed (license check pending, see design doc)
+data/
+
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+.next/
+bin/
+
+# Secrets: real tokens and passwords go in .env (Docker Compose reads it), never in git
+.env
+.env.*
+!.env.example
+*.pem
+*.key

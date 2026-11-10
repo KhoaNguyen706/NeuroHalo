@@ -1,0 +1,29 @@
+syntax = "proto3";
+package neuro.v1;
+
+option go_package = "github.com/neurohalo/neurohalo/gen/neuro/v1;neurov1";
+
+// What the processor writes to eeg.features and eeg.events.
+
+enum Quality {
+  QUALITY_UNSPECIFIED = 0;
+  QUALITY_OK = 1;
+  QUALITY_FLAT = 2;
+  QUALITY_NOISY = 3;
+}
+
+message FeatureFrame {
+  string session_id = 1;
+  uint64 window_index = 2;
+  int64 newest_sent_time_unix_nanos = 3;  // copied from the newest batch in the window
+  repeated float band_power = 4;          // channels x 5 bands, row by row
+  repeated Quality quality = 5;           // one per channel
+}
+
+message Event {
+  string session_id = 1;
+  string type = 2;
+  string channel = 3;                     // empty when the event covers the whole head
+  int64 time_unix_nanos = 4;
+  string details_json = 5;
+}

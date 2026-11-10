@@ -1,0 +1,14 @@
+[project]
+name = "neurohalo-replayer"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "grpcio>=1.85.1",
+    "mne>=1.13.2",
+    "protobuf>=7.36.2",
+]
+
+[dependency-groups]
+dev = [
+    "grpcio-tools>=1.85.1",
+]
