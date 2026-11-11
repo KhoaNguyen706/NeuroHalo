@@ -40,6 +40,11 @@ type session struct {
 	filled  int
 	scratch []float32 // one sensor's window, in time order
 
+	// Correlation links; linkPairs is nil when LINKS_ENABLED is off.
+	linkPairs   [][2]int  // pairs far enough apart, from linkConfig.allowedPairs
+	linkWindows []float32 // every sensor's window, channels x win, in time order
+	linkScratch []float64 // centered copy of linkWindows, used by computeLinks
+
 	// Per sensor: how many windows in a row were not OK, the latest quality and
 	// how many windows in a row had it, whether the sensor is marked bad, and
 	// the reason it was last marked bad.
@@ -58,7 +63,8 @@ type session struct {
 
 // newSession builds empty state for one stream: a 2-second buffer per sensor,
 // an analyzer for that window size, and the list of back-of-head sensors.
-func newSession(id string, sampleRateHz float64, names []string, startedAt time.Time) *session {
+// With links (nil when they are off) it also lists the sensor pairs to correlate.
+func newSession(id string, sampleRateHz float64, names []string, startedAt time.Time, links *linkConfig) *session {
 	win := eeg.WindowSamples(sampleRateHz)
 	n := len(names)
 	s := &session{
@@ -77,6 +83,11 @@ func newSession(id string, sampleRateHz float64, names []string, startedAt time.
 		sameRun:   make([]int, n),
 		bad:       make([]bool, n),
 		badQ:      make([]neurov1.Quality, n),
+	}
+	if links != nil {
+		s.linkPairs = links.allowedPairs(names)
+		s.linkWindows = make([]float32, win*n)
+		s.linkScratch = make([]float64, win*n)
 	}
 	for i, name := range names {
 		if eeg.BackOfHead(name) {
@@ -132,7 +143,7 @@ func (s *session) add(b *neurov1.SampleBatch) batchResult {
 }
 
 // compute builds one FeatureFrame from the current 2-second buffer: band
-// power and quality for every sensor.
+// power and quality for every sensor, plus the correlation links when they are on.
 func (s *session) compute(windowIndex uint64, sentTime int64) *neurov1.FeatureFrame {
 	frame := &neurov1.FeatureFrame{
 		SessionId:               s.id,
@@ -146,6 +157,12 @@ func (s *session) compute(windowIndex uint64, sentTime int64) *neurov1.FeatureFr
 			s.scratch[i] = s.ring[((s.pos+i)%s.win)*s.channels+c]
 		}
 		frame.Quality[c] = s.analyzer.Analyze(s.scratch, frame.BandPower[c*eeg.NumBands:(c+1)*eeg.NumBands])
+		if s.linkPairs != nil {
+			copy(s.linkWindows[c*s.win:], s.scratch)
+		}
+	}
+	if s.linkPairs != nil {
+		frame.Links = computeLinks(s.linkWindows, s.win, frame.Quality, s.linkPairs, s.linkScratch)
 	}
 	return frame
 }

@@ -245,7 +245,8 @@ func (s *store) flush(ctx context.Context, b *bucket) error {
 	err := retry(ctx, "write rollup "+b.sessionID, func(ctx context.Context) error {
 		_, err := s.db.Exec(ctx, `
 			INSERT INTO rollups (session_id, bucket_start, band_power, bad_channels, frames)
-			VALUES ($1, $2, $3, $4, $5)
+			SELECT $1::text, $2::timestamptz, $3::real[], $4::text[], $5::integer
+			WHERE EXISTS (SELECT 1 FROM sessions WHERE id = $1) -- skipped when the session was deleted meanwhile
 			ON CONFLICT (session_id, bucket_start) DO UPDATE
 			SET band_power = EXCLUDED.band_power, bad_channels = EXCLUDED.bad_channels, frames = EXCLUDED.frames
 			WHERE rollups.frames <= EXCLUDED.frames`,
@@ -294,7 +295,8 @@ func (s *store) writeEvents(ctx context.Context) error {
 			}
 			batch.Queue(`
 				INSERT INTO events (session_id, type, channel, at, details)
-				VALUES ($1, $2, $3, $4, $5::jsonb)
+				SELECT $1::text, $2::text, $3::text, $4::timestamptz, $5::jsonb
+				WHERE EXISTS (SELECT 1 FROM sessions WHERE id = $1) -- skipped when the session was deleted meanwhile
 				ON CONFLICT DO NOTHING`,
 				e.SessionId, e.Type, e.Channel, time.Unix(0, e.TimeUnixNanos), details)
 		}

@@ -1,5 +1,5 @@
-// The api service serves session history over REST and stores events and
-// rollups. The live WebSocket arrives in build step 6.
+// The api service serves session history over REST, pushes live frames over
+// WebSocket, stores events and rollups, and accepts uploads.
 package main
 
 import (
@@ -25,9 +25,10 @@ func env(name, fallback string) string {
 	return fallback
 }
 
-// main connects to Postgres and Kafka, starts the store consumer and the HTTP
-// server, and runs until Ctrl+C or SIGTERM. If the store consumer fails, the
-// process exits so the container restarts and resumes from the last commit.
+// main connects to Postgres, Kafka and the object store, starts the store
+// consumer, the live consumer and the HTTP server, and runs until Ctrl+C or
+// SIGTERM. If the store consumer fails, the process exits so the container
+// restarts and resumes from the last commit.
 func main() {
 	token := os.Getenv("API_TOKEN")
 	if token == "" {
@@ -45,6 +46,7 @@ func main() {
 	st := newStore(db)
 	st.kafka, err = kgo.NewClient(
 		kgo.SeedBrokers(strings.Split(env("KAFKA_BROKERS", "localhost:29092"), ",")...),
+		kgo.ClientID("api-store"),
 		kgo.ConsumerGroup(storeGroup),
 		kgo.ConsumeTopics(featuresTopic, eventsTopic),
 		kgo.DisableAutoCommit(),
@@ -57,9 +59,34 @@ func main() {
 	}
 	defer st.kafka.Close()
 
+	brokers := strings.Split(env("KAFKA_BROKERS", "localhost:29092"), ",")
+	a := &api{
+		db:      db,
+		token:   token,
+		hub:     newHub(),
+		origins: strings.Split(env("WEB_ORIGIN", "http://localhost:3000"), ","),
+	}
+
+	if endpoint := os.Getenv("S3_ENDPOINT"); endpoint != "" {
+		a.objects, err = newObjectStore(endpoint, os.Getenv("S3_ACCESS_KEY"), os.Getenv("S3_SECRET_KEY"),
+			env("S3_BUCKET", "recordings"), os.Getenv("S3_SECURE") == "true")
+		if err != nil {
+			log.Fatalf("object store: %v", err)
+		}
+		go a.objects.ensureBucket(ctx)
+	} else {
+		log.Print("S3_ENDPOINT is not set, uploads are off")
+	}
+
+	go func() {
+		if err := runLiveConsumer(ctx, brokers, a.hub); err != nil {
+			log.Fatalf("live consumer stopped: %v", err)
+		}
+	}()
+
 	srv := &http.Server{
 		Addr:              env("LISTEN_ADDR", ":8080"),
-		Handler:           (&api{db: db, token: token}).routes(),
+		Handler:           a.routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {

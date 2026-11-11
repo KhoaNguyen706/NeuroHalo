@@ -4,11 +4,14 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "grpcio>=1.85.1",
+    "minio>=7.2.20",
     "mne>=1.13.2",
     "protobuf>=7.36.2",
+    "psycopg[binary]>=3.3.8",
 ]
 
 [dependency-groups]
 dev = [
     "grpcio-tools>=1.85.1",
+    "nibabel>=5.5.0",
 ]

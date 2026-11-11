@@ -8,21 +8,29 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/minio/minio-go/v7"
 
 	"github.com/neurohalo/neurohalo/internal/eeg"
 )
 
-// api serves session history over REST.
+// api serves session history over REST, live frames over WebSocket, and
+// starts replays of samples and uploads.
 // Created by: main.
-// Used by: routes, requireToken, listSessions, getSession, listEvents,
-// listRollups, sessionExists (its methods).
+// Used by: routes, cors, requireToken, listSessions, getSession, listEvents,
+// listRollups, sessionExists (http.go); liveSession (live.go); listSamples,
+// playSample, upload, getReplay, queueReplay (uploads.go).
 type api struct {
-	db    *pgxpool.Pool
-	token string
+	db        *pgxpool.Pool
+	token     string
+	hub       *hub
+	objects   *objectStore // nil when uploads are not configured
+	origins   []string     // web app origins allowed by CORS and the WebSocket
+	wsClients atomic.Int64
 }
 
 // sessionJSON is one session as the REST endpoints return it.
@@ -30,6 +38,7 @@ type api struct {
 // Used by: listSessions, getSession.
 type sessionJSON struct {
 	ID           string     `json:"id"`
+	Label        string     `json:"label"` // sample title or uploaded file name; empty for hand-run replays
 	Source       string     `json:"source"`
 	SampleRateHz float64    `json:"sampleRateHz"`
 	ChannelNames []string   `json:"channelNames"`
@@ -56,22 +65,61 @@ type rollupJSON struct {
 	Frames      int       `json:"frames"`
 }
 
-const sessionColumns = `id, source, sample_rate_hz, channel_names, started_at, ended_at, status`
+// sessionSelect reads sessions with the label of the replay that started them.
+const sessionSelect = `SELECT s.id, COALESCE(r.label, ''), s.source, s.sample_rate_hz, s.channel_names,
+	s.started_at, s.ended_at, s.status
+	FROM sessions s LEFT JOIN replays r ON r.session_id = s.id`
 
-// routes returns the REST handler, with every path behind the bearer token.
+// routes returns the HTTP handler: CORS outside, then the bearer token, then
+// the endpoints.
 func (a *api) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /sessions", a.listSessions)
 	mux.HandleFunc("GET /sessions/{id}", a.getSession)
+	mux.HandleFunc("DELETE /sessions/{id}", a.deleteSession)
 	mux.HandleFunc("GET /sessions/{id}/events", a.listEvents)
 	mux.HandleFunc("GET /sessions/{id}/rollups", a.listRollups)
-	return a.requireToken(mux)
+	mux.HandleFunc("GET /ws/sessions/{id}/live", a.liveSession)
+	mux.HandleFunc("GET /samples", a.listSamples)
+	mux.HandleFunc("POST /samples/{name}/play", a.playSample)
+	mux.HandleFunc("POST /uploads", a.upload)
+	mux.HandleFunc("GET /replays/{id}", a.getReplay)
+	mux.HandleFunc("POST /sessions/{id}/replay", a.replayFrom)
+	return a.cors(a.requireToken(mux))
+}
+
+// cors lets the web app, served from another origin, call the api: it answers
+// preflight requests and marks responses for allowed origins.
+func (a *api) cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		for _, o := range a.origins {
+			if origin == o {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE")
+				w.Header().Set("Access-Control-Max-Age", "600")
+				w.Header().Add("Vary", "Origin")
+				break
+			}
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // requireToken rejects a request without "Authorization: Bearer <token>".
+// Browsers cannot set headers on a WebSocket, so /ws/ paths may pass the
+// token as ?token= instead.
 func (a *api) requireToken(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !ok && strings.HasPrefix(r.URL.Path, "/ws/") {
+			got, ok = r.URL.Query().Get("token"), true
+		}
 		if !ok || subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) != 1 {
 			writeError(w, http.StatusUnauthorized, "missing or wrong bearer token")
 			return
@@ -100,10 +148,10 @@ func serverError(w http.ResponseWriter, r *http.Request, err error) {
 	writeError(w, http.StatusInternalServerError, "internal error")
 }
 
-// scanSession reads one row selected with sessionColumns.
+// scanSession reads one row selected with sessionSelect.
 func scanSession(row pgx.Row) (sessionJSON, error) {
 	var s sessionJSON
-	err := row.Scan(&s.ID, &s.Source, &s.SampleRateHz, &s.ChannelNames, &s.StartedAt, &s.EndedAt, &s.Status)
+	err := row.Scan(&s.ID, &s.Label, &s.Source, &s.SampleRateHz, &s.ChannelNames, &s.StartedAt, &s.EndedAt, &s.Status)
 	return s, err
 }
 
@@ -122,7 +170,7 @@ func (a *api) sessionExists(w http.ResponseWriter, r *http.Request, id string) b
 
 // listSessions handles GET /sessions: the newest 100 sessions, newest first.
 func (a *api) listSessions(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.db.Query(r.Context(), `SELECT `+sessionColumns+` FROM sessions ORDER BY started_at DESC LIMIT 100`)
+	rows, err := a.db.Query(r.Context(), sessionSelect+` ORDER BY s.started_at DESC LIMIT 100`)
 	if err != nil {
 		serverError(w, r, err)
 		return
@@ -146,8 +194,7 @@ func (a *api) listSessions(w http.ResponseWriter, r *http.Request) {
 // getSession handles GET /sessions/{id}: one session with its channel names
 // and sample rate.
 func (a *api) getSession(w http.ResponseWriter, r *http.Request) {
-	s, err := scanSession(a.db.QueryRow(r.Context(),
-		`SELECT `+sessionColumns+` FROM sessions WHERE id = $1`, r.PathValue("id")))
+	s, err := scanSession(a.db.QueryRow(r.Context(), sessionSelect+` WHERE s.id = $1`, r.PathValue("id")))
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		writeError(w, http.StatusNotFound, "no such session")
@@ -156,6 +203,72 @@ func (a *api) getSession(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusOK, s)
 	}
+}
+
+// deleteSession handles DELETE /sessions/{id}: removes an ended session with
+// its events, rollups, summary and replay job, all in one transaction. A
+// live session is refused (409): its stream is still writing. When the
+// session came from an upload that no other session uses, the stored file is
+// removed too.
+func (a *api) deleteSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	ctx := r.Context()
+	tx, err := a.db.Begin(ctx)
+	if err != nil {
+		serverError(w, r, err)
+		return
+	}
+	defer tx.Rollback(ctx) // does nothing after a commit
+
+	var status string
+	err = tx.QueryRow(ctx, `SELECT status FROM sessions WHERE id = $1 FOR UPDATE`, id).Scan(&status)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		writeError(w, http.StatusNotFound, "no such session")
+		return
+	case err != nil:
+		serverError(w, r, err)
+		return
+	case status == "live":
+		writeError(w, http.StatusConflict, "the session is still live; wait until it has ended")
+		return
+	}
+
+	// The upload behind the session, if this is the last session that uses it.
+	var orphan string
+	err = tx.QueryRow(ctx, `
+		SELECT object_key FROM replays r
+		WHERE session_id = $1 AND kind = 'upload' AND object_key <> ''
+		  AND NOT EXISTS (SELECT 1 FROM replays o WHERE o.object_key = r.object_key AND o.session_id <> r.session_id)`,
+		id).Scan(&orphan)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		serverError(w, r, err)
+		return
+	}
+
+	for _, q := range []string{
+		`DELETE FROM events WHERE session_id = $1`,
+		`DELETE FROM rollups WHERE session_id = $1`,
+		`DELETE FROM summaries WHERE session_id = $1`,
+		`DELETE FROM replays WHERE session_id = $1`,
+		`DELETE FROM sessions WHERE id = $1`,
+	} {
+		if _, err := tx.Exec(ctx, q, id); err != nil {
+			serverError(w, r, err)
+			return
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		serverError(w, r, err)
+		return
+	}
+	// The rows are gone; a file left behind only wastes space, so a failure here is logged, not returned.
+	if orphan != "" && a.objects != nil {
+		if err := a.objects.client.RemoveObject(ctx, a.objects.bucket, orphan, minio.RemoveObjectOptions{}); err != nil {
+			log.Printf("delete session %s: cannot remove %s: %v", id, orphan, err)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
 }
 
 // listEvents handles GET /sessions/{id}/events: the session's events in time order.

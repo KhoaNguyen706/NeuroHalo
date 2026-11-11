@@ -6,6 +6,8 @@ __pycache__/
 *.pyc
 node_modules/
 .next/
+next-env.d.ts
+*.tsbuildinfo
 bin/
 
 # Secrets: real tokens and passwords go in .env (Docker Compose reads it), never in git

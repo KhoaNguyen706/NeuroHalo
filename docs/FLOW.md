@@ -2,7 +2,7 @@
 
 This file follows the data through the code. The **high-level** part shows the pieces and what travels between them. The **low-level** part walks through each program function by function, in the order they run.
 
-The reasons behind the design live in [`NeuroHalo v1 Low-Level Design.md`](../NeuroHalo%20v1%20Low-Level%20Design.md). This file describes what the code does today: build steps 1 to 5.
+The reasons behind the design live in [`NeuroHalo v1 Low-Level Design.md`](../NeuroHalo%20v1%20Low-Level%20Design.md). This file describes what the code does today: build steps 1 to 6, plus samples and uploads.
 
 ---
 
@@ -12,31 +12,38 @@ The reasons behind the design live in [`NeuroHalo v1 Low-Level Design.md`](../Ne
 
 ```mermaid
 flowchart LR
-    EDF[(EDF file)] --> R[replayer<br/>Python]
-    R -- "gRPC stream<br/>header + 100 ms batches" --> G[gateway<br/>Go]
-    G -- "save session" --> PG[(Postgres)]
+    WEB([web app<br/>Next.js + 3D head]) -- "upload / play sample" --> API[api<br/>Go]
+    API -- "EDF file" --> S3[(file storage<br/>S3 API)]
+    API -- "replay job" --> PG[(Postgres)]
+    PG -- "claim job" --> W[replay worker<br/>Python]
+    S3 --> W
+    W -- "gRPC stream<br/>header + 100 ms batches" --> G[gateway<br/>Go]
+    G -- "save session" --> PG
     G -- "SampleBatch" --> RAW[[eeg.raw]]
     RAW --> P[processor<br/>Go]
-    PG -. "session details" .-> P
     P -- "FeatureFrame<br/>every 0.5 s" --> FEAT[[eeg.features]]
     P -- "Event" --> EV[[eeg.events]]
-    FEAT --> S[api: store consumer]
-    EV --> S
-    S -- "events, 10 s rollups" --> PG
-    PG --> REST[api: REST]
-    REST --> U([you / web app])
+    FEAT --> API
+    EV --> API
+    API -- "events, 10 s rollups" --> PG
+    API -- "WebSocket: live frames<br/>REST: history" --> WEB
 ```
 
-One recording becomes a live stream, the stream becomes rhythm strength and events, and those end up in Postgres, where the REST API reads them.
+One recording becomes a live stream, and the stream becomes rhythm strength and events. Those go two ways at once: straight to the browser over a WebSocket, and into Postgres for history. The live path never waits on the database.
+
+A session can start three ways, and all three feed the same pipeline: a built-in sample, an uploaded file, or the replayer run by hand in a terminal.
 
 ## The pieces
 
 | Piece | Folder | Job in one line |
 | --- | --- | --- |
-| replayer | `replayer/` | Reads an EDF file and sends it to the gateway at real speed |
+| replayer | `replayer/replay.py` | Reads an EDF file and sends it to the gateway at real speed |
+| replay worker | `replayer/worker.py` | Picks up replay jobs (samples and uploads) and runs the replayer for each |
 | gateway | `gateway/` | Checks the token, validates every batch, forwards it to Kafka. Computes nothing |
 | processor | `processor/` | Turns raw samples into band power, quality flags and events. Talks only to Kafka (and reads session details from Postgres) |
-| api | `api/` | Stores events and rollups in Postgres; serves history over REST |
+| api | `api/` | Stores events and rollups; serves history over REST; pushes live frames over WebSocket; accepts uploads |
+| web | `web/` | The pages: start a session, then watch it live on a 3D head |
+| file storage | SeaweedFS in Compose | Keeps uploaded EDF files behind the S3 API (S3 itself on AWS) |
 | signal math | `internal/eeg/` | FFT, band power, quality rules; shared by processor and api |
 | contract | `proto/neuro/v1/` | The message formats every piece agrees on |
 | featuretail | `tools/featuretail/` | Terminal viewer for what the processor writes (debugging only) |
@@ -51,6 +58,7 @@ One recording becomes a live stream, the stream becomes rhythm strength and even
 | processor → `eeg.features` | `FeatureFrame`: 64 sensors × 5 bands + 64 quality flags | 320 floats | 2 a second |
 | processor → `eeg.events` | `Event` (`channel_bad`, `channel_recovered`, `alpha_rise`) | small | only when something happens |
 | api → Postgres | one `rollups` row per 10 seconds, event rows as they come | | 0.1 rows a second plus events |
+| api → browser | one band of a frame: 64 values + 64 quality flags, as JSON | about 1 KB | 2 a second per viewer |
 
 Every Kafka message is **keyed by `session_id`**. Kafka sends all messages with the same key to the same partition, so one session's data always stays in order.
 
@@ -61,6 +69,7 @@ Every Kafka message is **keyed by `session_id`**. Kafka sends all messages with 
 | `sessions` | gateway (when the header arrives, and when the stream ends) | processor, api |
 | `events` | api store consumer | api REST |
 | `rollups` | api store consumer | api REST |
+| `replays` | api (queues a job), replay worker (claims it, records the result) | api REST, the session page while it waits |
 | `summaries` | nobody yet (build step 11) | |
 
 Raw samples are never stored in Postgres. The EDF files remain the source.
@@ -281,7 +290,120 @@ flowchart TD
 | `GET /sessions/{id}/events` | `listEvents` | `ORDER BY at, id` |
 | `GET /sessions/{id}/rollups?from=&to=` | `listRollups` | `from <= bucket_start < to`, both optional (RFC 3339), plus the band names |
 
-## 5. Life of one batch, end to end
+### Live view (`api/live.go`)
+
+```mermaid
+sequenceDiagram
+    participant B as browser
+    participant A as api.liveSession
+    participant H as hub
+    participant K as runLiveConsumer
+    B->>A: WS /ws/sessions/{id}/live?token=…
+    A->>H: add(viewer)
+    B->>A: {"type":"subscribe","band":"alpha"}
+    loop every 0.5 s per session
+        K->>H: publishFrame(frame)
+        H->>A: viewer.offerFrame (newest wins)
+        A->>B: {"type":"frame", power[64], quality[64]}
+    end
+    K->>H: publishEvent(event)
+    A->>B: {"type":"event", …}
+```
+
+1. `runLiveConsumer()` reads every partition of `eeg.features` and `eeg.events`, starting from the newest message. It uses no consumer group and commits nothing, so every api instance sees every frame.
+2. The `hub` maps a session ID to its viewers. `publishFrame()` calls `viewer.offerFrame()`.
+3. Each `viewer` has a **one-frame slot**. If the slot still holds an unsent frame, the new frame replaces it and `framesDropped` goes up. A slow viewer therefore skips to the newest frame and never slows anyone else.
+4. `liveSession()` handles one WebSocket. A reader goroutine takes `subscribe` messages and stores the band. The write loop sends frames (cut down to that band by `frameMessage()`), events, and a ping every 30 s.
+5. Browsers cannot set headers on a WebSocket, so `requireToken()` accepts `?token=` on `/ws/` paths. The `Origin` header must match `WEB_ORIGIN`.
+
+### Samples and uploads (`api/uploads.go`, `api/edf.go`)
+
+| Request | Handler | What it does |
+| --- | --- | --- |
+| `GET /samples` | `listSamples` | The three built-in samples |
+| `POST /samples/{name}/play?speed=1x\|fast` | `playSample` | Queues a replay of a sample; returns the new session ID |
+| `POST /uploads` (multipart `file`, `speed`) | `upload` | Checks, stores and queues an uploaded EDF; returns the session ID and what the header says |
+| `GET /replays/{id}` | `getReplay` | The job's state: queued, running, done or failed with a message |
+
+`upload()` runs these checks in order and stops at the first failure:
+1. The body is at most 50 MB (`http.MaxBytesReader`); otherwise 413.
+2. The file name ends in `.edf`; otherwise 400.
+3. `parseEDFHeader()` reads only the header and checks the version field, the header size against the signal count, and that the file is long enough for the records it promises. Otherwise 422 with the reason.
+4. The file is stored as `uploads/<generated id>.edf`. The name the user sent is cleaned by `cleanLabel()` and kept only as a display label.
+5. `queueReplay()` inserts a `replays` row with status `queued`.
+
+The session row itself does not exist yet. The gateway creates it when the worker's stream sends its header.
+
+## 5. Replay worker (`replayer/worker.py`)
+
+1. `main()` first marks any job left `running` by an earlier worker as failed. Then it loops, running at most `MAX_JOBS` (8) replays at once, each in its own thread.
+2. `claim()` takes the oldest queued job with `UPDATE … WHERE session_id = (SELECT … FOR UPDATE SKIP LOCKED)`. Two workers can never take the same job.
+3. `run_job()` gets the recording:
+   - **upload:** downloads the object from file storage to a temporary file;
+   - **sample:** `sample_path()` looks in the mounted `data/` folder and the cache, and otherwise downloads the file from PhysioNet. Only names shaped like `S001R02.edf` are accepted.
+4. It then calls the same code as the command-line replayer: `load_edf()`, `apply_flatten()`, `stream_recording()`. Speed `fast` is an infinite speed factor, so batches go out as fast as the gateway takes them.
+5. `finish()` records `done`, or `failed` with the error message, which the page shows.
+
+## 6. Web app (`web/`)
+
+| File | Job |
+| --- | --- |
+| `src/lib/api.ts` | REST calls, the WebSocket address, and the types of every answer |
+| `src/app/page.tsx` | Home: upload area, sample list, session list (refreshed every 3 s) |
+| `src/app/sessions/[id]/page.tsx` | The live session page: layout, band selector, event list, popover |
+| `src/app/sessions/[id]/page.module.css` | That page's styles |
+| `src/hooks/useLiveSession.ts` | All WebSocket logic |
+| `src/components/HeadScene.tsx` | The 3D scene of the live session page |
+| `src/positions.json` | Sensor name → x, y, z, generated once by `replayer/make_positions.py` |
+| `src/components/Head3D.tsx`, `src/lib/model.ts`, `src/lib/color.ts`, `public/model/` | The turning brain on the home page only |
+
+### Live session page
+
+The page is the 3D head, a 320 px rail (band selector, event list) and three small readouts in the top-left corner: session name, elapsed time, delay. Nothing else.
+
+```mermaid
+sequenceDiagram
+    participant P as SessionPage
+    participant H as useLiveSession
+    participant S as HeadScene
+    participant A as api
+    P->>A: GET /sessions/{id} (retried every second until it exists)
+    P->>H: useLiveSession(id, band, enabled)
+    H->>A: WebSocket open, then {"type":"subscribe","band":"alpha"}
+    loop every 0.5 s
+        A-->>H: frame
+        H->>H: frameRef.current = frame, set elapsed and delay
+        H-->>P: re-render (text only)
+    end
+    loop every animation frame
+        S->>H: read frameRef.current
+        S->>S: move each dot's color toward its target
+    end
+```
+
+**`useLiveSession(id, band, enabled)`**
+1. It opens the WebSocket and sends `subscribe` with the band. A second effect resends it whenever the band changes.
+2. Each frame is stored in `frameRef`, a ref, so the 3D scene can read it without React re-rendering. A frame that still carries the previous band is ignored.
+3. Elapsed time (`windowIndex × 0.5 s`) and delay (`Date.now() − sentTimeMs`) are state, so the top-left text updates once per frame from the server.
+4. Events are added to the front of a list, capped at 200.
+5. When the socket closes, `status` becomes `reconnecting` and it retries after 1, 2, 4, 8 and then 10 seconds.
+
+**`HeadScene`**
+1. `placeSensors()` puts each channel on a slightly stretched sphere, using `positions.json`. A channel with no known position goes in a row under the head.
+2. `Sensors` draws all dots as one `InstancedMesh` and all red rings as a second.
+3. Inside `useFrame`, each dot's color moves part of the way toward its target every animation frame. The target is the band's relative power mapped from dim to bright amber, with 60% or more at full brightness. Before the first frame every dot is grey.
+4. A ring is shown for every channel whose `quality` in the newest frame is not 1. Rings are laid out once per frame from the server, not every animation frame.
+5. `OrbitControls` allows rotation and limited zoom, no panning. The head turns slowly by itself until the first drag.
+6. `HeadScene` is wrapped in `memo` and gets only stable props, so the page's text updates never re-render it.
+
+**`SessionPage`**
+- The top-left text shows "Waiting for data" until the first frame and "Reconnecting…" while the socket is down.
+- Clicking a dot opens a popover with the channel name, its current value and its quality. It closes on its ×, or on a press anywhere else.
+- On a screen narrower than 800 px the rail moves below the head.
+
+**What this page does not do.** It shows only what arrives over the WebSocket. It does not load stored events or rollups, so a session that has already ended shows the grey head and "Waiting for data", and events that fired before the page opened are not listed. The REST endpoints for history still exist in the api.
+
+## 7. Life of one batch, end to end
 
 Take sensor `O1`, seconds 30.0 to 30.1 of the eyes-closed recording:
 
@@ -289,9 +411,10 @@ Take sensor `O1`, seconds 30.0 to 30.1 of the eyes-closed recording:
 2. **Gateway:** the batch passes `validateBatch` and goes to `eeg.raw`, keyed by the session ID. The gateway waits for Kafka's ack.
 3. **Processor:** `add()` sees `seq 300 = lastSeq + 1` and copies the 16 rows into the ring. Row 4,800 brings the count to 4,800, which is a multiple of 80. So it computes window 60 (seconds 28.0 to 30.0) and runs `detect()`. Both outputs are sent; then the offset is committed.
 4. **Api store:** window 60 ends at 30.0 s, so it goes into bucket 3 (30 to 40 s). When window 80 arrives, bucket 3 is flushed to `rollups` with `frames = 20`.
-5. **REST:** `GET /sessions/{id}/rollups` returns that row, with `O1`'s alpha at `bandPower[O1 × 5 + 2]`.
+5. **Live:** window 60 also reaches the live consumer, and every viewer of this session gets `{"type":"frame","windowIndex":60,…}` with `O1`'s alpha in `power`. On one machine this takes about 5 to 15 ms from the moment the batch was sent.
+6. **REST:** `GET /sessions/{id}/rollups` returns the bucket's row, with `O1`'s alpha at `bandPower[O1 × 5 + 2]`.
 
-## 6. When things break
+## 8. When things break
 
 | What breaks | What the code does | Where |
 | --- | --- | --- |
@@ -303,15 +426,26 @@ Take sensor `O1`, seconds 30.0 to 30.1 of the eyes-closed recording:
 | Postgres down | Processor and api retry with backoff and hold their offsets | `loadSession`, `retry` |
 | Wrong token | gateway: `UNAUTHENTICATED`; REST: 401 | `authorized`, `requireToken` |
 | Wrong-size batch | `INVALID_ARGUMENT`, stream ends | `validateBatch` |
+| A viewer is slow | It skips to the newest frame; other viewers are unaffected | `viewer.offerFrame` |
+| The WebSocket drops | The page shows "Reconnecting…", reconnects with backoff and subscribes again. Events that fire while it is down are not shown | `useLiveSession` |
+| An upload is not a real EDF | Rejected with 422 and the reason, before anything is stored | `parseEDFHeader` |
+| The recording cannot be read after upload | The job is marked failed with a message, readable at `GET /replays/{id}`. The live page does not show it; it stays on "Waiting for data" | `worker.run_job` |
+| The worker restarts mid-replay | That replay is marked failed; queued jobs run as normal | `worker.main` |
 
-Tested so far: gateway restart, api restart mid-bucket, wrong token, gaps and duplicates. The Kafka-down and wrong-size paths are written but not yet exercised.
+Tested so far: gateway restart, api restart mid-bucket, wrong token (gRPC, REST and WebSocket), a foreign WebSocket origin, gaps and duplicates, bad uploads, and a WebSocket drop (api restarted while a page was watching). Written but not yet exercised: Kafka down, a wrong-size batch, a slow viewer under real load, and a worker restart.
 
 ---
 
 # Running it
 
 ```powershell
-docker compose up -d --build                     # Kafka, Postgres, gateway, processor, api
+docker compose up -d --build                     # the whole stack
+# then open http://localhost:3000, play a sample or upload an .edf file
+```
+
+From a terminal, without the page:
+
+```powershell
 cd replayer
 uv run replay.py --file ../data/S001R02.edf      # eyes closed, real speed
 uv run replay.py --file ../data/S001R02.edf --flatten Cz@20
@@ -323,6 +457,10 @@ curl -H "Authorization: Bearer dev-token" http://localhost:8080/sessions
 | Task | Command |
 | --- | --- |
 | Any Go command (Go runs only in Docker) | `scripts/go.ps1 go test ./...` |
+| Any npm command (also in Docker) | `scripts/node.ps1 npm install` |
+| Rebuild one service after a change | `docker compose up -d --build web` |
+| Regenerate sensor positions for the live page | `uv run make_positions.py` |
+| Regenerate the home page's brain model (downloads fsaverage on first run) | `uv run make_head_model.py` |
 | Regenerate code after editing a `.proto` | `scripts/gen.ps1` |
 | Look inside an EDF file | `uv run inspect_edf.py ../data/S001R01.edf` |
 
@@ -330,7 +468,6 @@ curl -H "Authorization: Bearer dev-token" http://localhost:8080/sessions
 
 | Step | What |
 | --- | --- |
-| 6 | WebSocket `/ws/sessions/{id}/live` and the Next.js 3D head |
 | 8 | Prometheus metrics, Grafana |
 | 9 | Go load generator |
 | 10 | Kubernetes on kind |

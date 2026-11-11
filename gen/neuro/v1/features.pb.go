@@ -80,6 +80,7 @@ type FeatureFrame struct {
 	NewestSentTimeUnixNanos int64                  `protobuf:"varint,3,opt,name=newest_sent_time_unix_nanos,json=newestSentTimeUnixNanos,proto3" json:"newest_sent_time_unix_nanos,omitempty"` // copied from the newest batch in the window
 	BandPower               []float32              `protobuf:"fixed32,4,rep,packed,name=band_power,json=bandPower,proto3" json:"band_power,omitempty"`                                         // channels x 5 bands, row by row
 	Quality                 []Quality              `protobuf:"varint,5,rep,packed,name=quality,proto3,enum=neuro.v1.Quality" json:"quality,omitempty"`                                         // one per channel
+	Links                   []*Link                `protobuf:"bytes,6,rep,name=links,proto3" json:"links,omitempty"`                                                                           // strongest correlated sensor pairs; empty unless LINKS_ENABLED
 	unknownFields           protoimpl.UnknownFields
 	sizeCache               protoimpl.SizeCache
 }
@@ -149,6 +150,74 @@ func (x *FeatureFrame) GetQuality() []Quality {
 	return nil
 }
 
+func (x *FeatureFrame) GetLinks() []*Link {
+	if x != nil {
+		return x.Links
+	}
+	return nil
+}
+
+// One correlated sensor pair. a < b, both channel indexes.
+type Link struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	A             uint32                 `protobuf:"varint,1,opt,name=a,proto3" json:"a,omitempty"`
+	B             uint32                 `protobuf:"varint,2,opt,name=b,proto3" json:"b,omitempty"`
+	Strength      float32                `protobuf:"fixed32,3,opt,name=strength,proto3" json:"strength,omitempty"` // |Pearson r| over the 2-second window, 0..1
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Link) Reset() {
+	*x = Link{}
+	mi := &file_neuro_v1_features_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Link) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Link) ProtoMessage() {}
+
+func (x *Link) ProtoReflect() protoreflect.Message {
+	mi := &file_neuro_v1_features_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Link.ProtoReflect.Descriptor instead.
+func (*Link) Descriptor() ([]byte, []int) {
+	return file_neuro_v1_features_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *Link) GetA() uint32 {
+	if x != nil {
+		return x.A
+	}
+	return 0
+}
+
+func (x *Link) GetB() uint32 {
+	if x != nil {
+		return x.B
+	}
+	return 0
+}
+
+func (x *Link) GetStrength() float32 {
+	if x != nil {
+		return x.Strength
+	}
+	return 0
+}
+
 type Event struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
@@ -162,7 +231,7 @@ type Event struct {
 
 func (x *Event) Reset() {
 	*x = Event{}
-	mi := &file_neuro_v1_features_proto_msgTypes[1]
+	mi := &file_neuro_v1_features_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -174,7 +243,7 @@ func (x *Event) String() string {
 func (*Event) ProtoMessage() {}
 
 func (x *Event) ProtoReflect() protoreflect.Message {
-	mi := &file_neuro_v1_features_proto_msgTypes[1]
+	mi := &file_neuro_v1_features_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -187,7 +256,7 @@ func (x *Event) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Event.ProtoReflect.Descriptor instead.
 func (*Event) Descriptor() ([]byte, []int) {
-	return file_neuro_v1_features_proto_rawDescGZIP(), []int{1}
+	return file_neuro_v1_features_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *Event) GetSessionId() string {
@@ -229,7 +298,7 @@ var File_neuro_v1_features_proto protoreflect.FileDescriptor
 
 const file_neuro_v1_features_proto_rawDesc = "" +
 	"\n" +
-	"\x17neuro/v1/features.proto\x12\bneuro.v1\"\xda\x01\n" +
+	"\x17neuro/v1/features.proto\x12\bneuro.v1\"\x80\x02\n" +
 	"\fFeatureFrame\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12!\n" +
@@ -237,7 +306,12 @@ const file_neuro_v1_features_proto_rawDesc = "" +
 	"\x1bnewest_sent_time_unix_nanos\x18\x03 \x01(\x03R\x17newestSentTimeUnixNanos\x12\x1d\n" +
 	"\n" +
 	"band_power\x18\x04 \x03(\x02R\tbandPower\x12+\n" +
-	"\aquality\x18\x05 \x03(\x0e2\x11.neuro.v1.QualityR\aquality\"\x9f\x01\n" +
+	"\aquality\x18\x05 \x03(\x0e2\x11.neuro.v1.QualityR\aquality\x12$\n" +
+	"\x05links\x18\x06 \x03(\v2\x0e.neuro.v1.LinkR\x05links\">\n" +
+	"\x04Link\x12\f\n" +
+	"\x01a\x18\x01 \x01(\rR\x01a\x12\f\n" +
+	"\x01b\x18\x02 \x01(\rR\x01b\x12\x1a\n" +
+	"\bstrength\x18\x03 \x01(\x02R\bstrength\"\x9f\x01\n" +
 	"\x05Event\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x12\n" +
@@ -265,19 +339,21 @@ func file_neuro_v1_features_proto_rawDescGZIP() []byte {
 }
 
 var file_neuro_v1_features_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_neuro_v1_features_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_neuro_v1_features_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
 var file_neuro_v1_features_proto_goTypes = []any{
 	(Quality)(0),         // 0: neuro.v1.Quality
 	(*FeatureFrame)(nil), // 1: neuro.v1.FeatureFrame
-	(*Event)(nil),        // 2: neuro.v1.Event
+	(*Link)(nil),         // 2: neuro.v1.Link
+	(*Event)(nil),        // 3: neuro.v1.Event
 }
 var file_neuro_v1_features_proto_depIdxs = []int32{
 	0, // 0: neuro.v1.FeatureFrame.quality:type_name -> neuro.v1.Quality
-	1, // [1:1] is the sub-list for method output_type
-	1, // [1:1] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	2, // 1: neuro.v1.FeatureFrame.links:type_name -> neuro.v1.Link
+	2, // [2:2] is the sub-list for method output_type
+	2, // [2:2] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_neuro_v1_features_proto_init() }
@@ -291,7 +367,7 @@ func file_neuro_v1_features_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_neuro_v1_features_proto_rawDesc), len(file_neuro_v1_features_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   2,
+			NumMessages:   3,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

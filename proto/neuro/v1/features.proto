@@ -18,6 +18,14 @@ message FeatureFrame {
   int64 newest_sent_time_unix_nanos = 3;  // copied from the newest batch in the window
   repeated float band_power = 4;          // channels x 5 bands, row by row
   repeated Quality quality = 5;           // one per channel
+  repeated Link links = 6;                // strongest correlated sensor pairs; empty unless LINKS_ENABLED
+}
+
+// One correlated sensor pair. a < b, both channel indexes.
+message Link {
+  uint32 a = 1;
+  uint32 b = 2;
+  float strength = 3;                     // |Pearson r| over the 2-second window, 0..1
 }
 
 message Event {

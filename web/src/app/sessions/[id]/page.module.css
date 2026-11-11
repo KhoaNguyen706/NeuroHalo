@@ -1,0 +1,291 @@
+/* The live session page. One font family, two font sizes (12px and 14px),
+   one accent color, plus red for bad sensors. The colors are the theme
+   variables in globals.css. */
+
+.page {
+  --small: 12px;
+  --base: 14px;
+  --row: 32px; /* height of one event row */
+
+  height: 100dvh;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans), system-ui, sans-serif;
+  font-size: var(--base);
+}
+
+.main {
+  display: flex; /* the head fills what the chart under it leaves */
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.stage {
+  flex: 1;
+  position: relative; /* the top-left text and the popover are placed inside it */
+  min-width: 0;
+  min-height: 0;
+}
+
+.info {
+  position: absolute;
+  top: 16px;
+  left: 18px;
+  display: flex;
+  gap: 16px;
+  font-size: var(--small);
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums; /* digits keep their width, so the text does not jitter */
+  pointer-events: none; /* dragging over the text still rotates the head */
+}
+
+.popover {
+  position: absolute;
+  width: 150px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--line-2);
+  font-size: var(--small);
+  color: var(--ink-2);
+}
+
+.channel {
+  font-size: var(--base);
+  color: var(--ink);
+}
+
+.close {
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  padding: 4px 6px;
+  border: none;
+  background: none;
+  color: var(--ink-2);
+  font-size: var(--base);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 16px 18px;
+  border-left: 1px solid var(--line);
+  min-height: 0;
+}
+
+.bands {
+  display: flex;
+  justify-content: space-between;
+}
+
+.bands button {
+  padding: 4px 0;
+  border: none;
+  border-radius: 0;
+  background: none;
+  color: var(--ink-2);
+  font-size: var(--base);
+  cursor: pointer;
+}
+
+.bands button[aria-pressed="true"] {
+  color: var(--accent);
+}
+
+/* "Signal correlation": text only, accent when on, like a band button. */
+.toggle {
+  align-self: flex-start;
+  padding: 4px 0;
+  border: none;
+  border-radius: 0;
+  background: none;
+  color: var(--ink-2);
+  font-size: var(--base);
+  cursor: pointer;
+}
+
+.toggle[aria-pressed="true"] {
+  color: var(--accent);
+}
+
+.bands button:focus-visible,
+.toggle:focus-visible,
+.close:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: calc(8 * var(--row)); /* 8 events visible; the rest scroll */
+  overflow-y: auto;
+}
+
+.events li {
+  height: var(--row);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+/* Each event row is a button: picking it highlights its sensor and its time on the chart. */
+.events li button {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.events li button[aria-pressed="true"] {
+  color: var(--accent);
+}
+
+.events li button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.toggle:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+/* The chart's line choice (All, Regions, Left / right) and the CSV exports:
+   small text buttons, accent when chosen. */
+.modes,
+.exports {
+  display: flex;
+  gap: 14px;
+}
+
+.exports {
+  margin-top: auto; /* at the bottom of the rail */
+}
+
+.modes button,
+.exports button {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: var(--small);
+  cursor: pointer;
+}
+
+.modes button[aria-pressed="true"] {
+  color: var(--accent);
+}
+
+.exports button:hover {
+  color: var(--ink);
+}
+
+.modes button:focus-visible,
+.exports button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 3px;
+}
+
+/* "Replay from 0:20 to 0:40 Play": two short time fields and a button, in one line. */
+.replay {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: var(--base);
+}
+
+.replay input {
+  width: 52px;
+  padding: 2px 4px;
+  border: none;
+  border-bottom: 1px solid var(--line-2);
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.replay input::placeholder {
+  color: var(--faint);
+}
+
+.replay input:focus-visible {
+  outline: none;
+  border-bottom-color: var(--accent);
+}
+
+.replay button {
+  margin-left: 4px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+.replay button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 3px;
+}
+
+/* Data quality at the top of the rail: how many sensors are OK, then the bad ones in red. */
+.quality {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--small);
+  color: var(--ink-2);
+}
+
+.bad {
+  color: var(--red);
+}
+
+.time {
+  width: 36px;
+  font-size: var(--small);
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* On a narrow screen the rail moves below the head. */
+@media (max-width: 800px) {
+  .page {
+    height: auto;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto;
+  }
+
+  .stage {
+    flex: none;
+    height: 62dvh;
+  }
+
+  .rail {
+    border-left: none;
+    border-top: 1px solid var(--line);
+  }
+}

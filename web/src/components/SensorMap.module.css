@@ -1,0 +1,41 @@
+/* The flat sensor map, an inset in the top-right corner of the 3D view. */
+
+.map {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: min(400px, 46%);
+  aspect-ratio: 1;
+  background: var(--overlay);
+  border: 1px solid var(--line);
+}
+
+.head {
+  fill: none;
+  stroke: var(--line-2);
+  stroke-width: 1;
+}
+
+.edge,
+.badEdge {
+  stroke-width: 1.5;
+  transition: stroke 0.4s linear; /* blends one frame into the next */
+}
+
+.badEdge {
+  stroke-width: 2;
+}
+
+.node {
+  cursor: pointer;
+}
+
+.node circle {
+  transition: fill 0.4s linear;
+}
+
+.ring {
+  fill: none;
+  stroke: var(--red);
+  stroke-width: 2;
+}

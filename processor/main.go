@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"google.golang.org/protobuf/proto"
 
@@ -39,6 +41,7 @@ type processor struct {
 	kafka    *kgo.Client
 	db       *pgxpool.Pool
 	sessions map[string]*session // nil value: session is not in Postgres, skip it
+	links    *linkConfig         // nil when LINKS_ENABLED is off
 
 	produceErr atomic.Pointer[error]
 
@@ -60,7 +63,7 @@ func (p *processor) loadSession(ctx context.Context, id string) (*session, error
 		cancel()
 		switch {
 		case err == nil:
-			return newSession(id, rate, names, startedAt), nil
+			return newSession(id, rate, names, startedAt, p.links), nil
 		case errors.Is(err, pgx.ErrNoRows):
 			return nil, nil
 		case ctx.Err() != nil:
@@ -204,11 +207,27 @@ func env(name, fallback string) string {
 	return fallback
 }
 
-// main connects to Kafka (as consumer group "processor") and Postgres, then
-// runs the loop until Ctrl+C or SIGTERM.
+// main connects to Kafka (as consumer group "processor") and Postgres, serves
+// Prometheus metrics on METRICS_ADDR, then runs the loop until Ctrl+C or SIGTERM.
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	links, err := loadLinkConfig()
+	if err != nil {
+		log.Fatalf("links: %v", err)
+	}
+	if links != nil {
+		log.Printf("links on, sensors at least %.0f degrees apart", links.minAngleDeg)
+	}
+
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		if err := http.ListenAndServe(env("METRICS_ADDR", ":9100"), mux); err != nil {
+			log.Printf("metrics: %v", err)
+		}
+	}()
 
 	kafka, err := kgo.NewClient(
 		kgo.SeedBrokers(strings.Split(env("KAFKA_BROKERS", "localhost:29092"), ",")...),
@@ -227,7 +246,7 @@ func main() {
 	}
 	defer db.Close()
 
-	p := &processor{kafka: kafka, db: db, sessions: map[string]*session{}}
+	p := &processor{kafka: kafka, db: db, sessions: map[string]*session{}, links: links}
 	log.Printf("processor started, group %q reading %s", group, rawTopic)
 	if err := p.run(ctx); err != nil {
 		log.Fatalf("processor stopped: %v", err)
