@@ -169,8 +169,11 @@ func (a *api) sessionExists(w http.ResponseWriter, r *http.Request, id string) b
 }
 
 // listSessions handles GET /sessions: the newest 100 sessions, newest first.
+// Load-test sessions (source "loadgen") are left out, so a test with 1,000
+// of them does not bury the real ones; each is still reachable by its ID.
 func (a *api) listSessions(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.db.Query(r.Context(), sessionSelect+` ORDER BY s.started_at DESC LIMIT 100`)
+	rows, err := a.db.Query(r.Context(),
+		sessionSelect+` WHERE s.source <> 'loadgen' ORDER BY s.started_at DESC LIMIT 100`)
 	if err != nil {
 		serverError(w, r, err)
 		return

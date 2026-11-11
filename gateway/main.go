@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -22,7 +24,34 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/neurohalo/neurohalo/internal/metrics"
+
 	neurov1 "github.com/neurohalo/neurohalo/gen/neuro/v1"
+)
+
+// The gateway's Prometheus metrics.
+var (
+	// ingestBatches counts batches Kafka has confirmed. Raised by: server.publish.
+	ingestBatches = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "ingest_batches_total",
+		Help: "Batches accepted and stored in Kafka.",
+	})
+	// ingestBytes counts the encoded size of those batches. Raised by: server.publish.
+	ingestBytes = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "ingest_bytes_total",
+		Help: "Encoded bytes of the batches stored in Kafka.",
+	})
+	// activeStreams is how many client streams are open right now. Moved by: server.Stream.
+	activeStreams = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "active_streams",
+		Help: "Client streams open right now.",
+	})
+	// rejectedBatches counts batches refused, by reason: session_id,
+	// num_samples, values (wrong count) or not_batch. Raised by: validateBatch, server.Stream.
+	rejectedBatches = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "rejected_batches_total",
+		Help: "Batches refused by validation, by reason.",
+	}, []string{"reason"})
 )
 
 const (
@@ -81,10 +110,13 @@ func validateBatch(h *neurov1.SessionHeader, b *neurov1.SampleBatch) error {
 	want := int(b.NumSamples) * len(h.ChannelNames)
 	switch {
 	case b.SessionId != h.SessionId:
+		rejectedBatches.WithLabelValues("session_id").Inc()
 		return status.Errorf(codes.InvalidArgument, "batch %d: session_id %q does not match header %q", b.Seq, b.SessionId, h.SessionId)
 	case b.NumSamples == 0 || b.NumSamples > maxSamples:
+		rejectedBatches.WithLabelValues("num_samples").Inc()
 		return status.Errorf(codes.InvalidArgument, "batch %d: num_samples %d outside 1..%d", b.Seq, b.NumSamples, maxSamples)
 	case len(b.Values) != want:
+		rejectedBatches.WithLabelValues("values").Inc()
 		return status.Errorf(codes.InvalidArgument, "batch %d: %d values, want %d (num_samples x channels)", b.Seq, len(b.Values), want)
 	}
 	return nil
@@ -126,7 +158,12 @@ func (s *server) publish(ctx context.Context, b *neurov1.SampleBatch) error {
 	ctx, cancel := context.WithTimeout(ctx, publishTimeout)
 	defer cancel()
 	rec := &kgo.Record{Topic: rawTopic, Key: []byte(b.SessionId), Value: value}
-	return s.kafka.ProduceSync(ctx, rec).FirstErr()
+	if err := s.kafka.ProduceSync(ctx, rec).FirstErr(); err != nil {
+		return err
+	}
+	ingestBatches.Inc()
+	ingestBytes.Add(float64(len(value)))
+	return nil
 }
 
 // Stream handles one client stream from start to finish: check the token,
@@ -137,6 +174,8 @@ func (s *server) Stream(stream grpc.ClientStreamingServer[neurov1.IngestRequest,
 		return status.Error(codes.Unauthenticated, "missing or wrong bearer token")
 	}
 	ctx := stream.Context()
+	activeStreams.Inc()
+	defer activeStreams.Dec()
 
 	first, err := stream.Recv()
 	if err != nil {
@@ -170,6 +209,7 @@ func (s *server) Stream(stream grpc.ClientStreamingServer[neurov1.IngestRequest,
 		}
 		batch := req.GetBatch()
 		if batch == nil {
+			rejectedBatches.WithLabelValues("not_batch").Inc()
 			return status.Error(codes.InvalidArgument, "only the first message may be a header")
 		}
 		if err := validateBatch(header, batch); err != nil {
@@ -199,14 +239,16 @@ func env(name, fallback string) string {
 	return fallback
 }
 
-// main reads the configuration, connects to Kafka and Postgres, and serves
-// the Ingest service over gRPC until the process is stopped.
+// main reads the configuration, connects to Kafka and Postgres, serves
+// Prometheus metrics on METRICS_ADDR, and serves the Ingest service over gRPC
+// until the process is stopped.
 func main() {
 	token := os.Getenv("INGEST_TOKEN")
 	if token == "" {
 		log.Fatal("INGEST_TOKEN is not set")
 	}
 	addr := env("LISTEN_ADDR", ":50051")
+	metrics.Serve(env("METRICS_ADDR", ":9100"))
 
 	// franz-go defaults already match the design: acks=all with idempotence on.
 	kafka, err := kgo.NewClient(

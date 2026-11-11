@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -16,11 +15,35 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/neurohalo/neurohalo/internal/metrics"
+
 	neurov1 "github.com/neurohalo/neurohalo/gen/neuro/v1"
+)
+
+// The processor's Prometheus metrics (links_compute_seconds is in links.go).
+var (
+	// windowComputeSeconds times one window: band power, quality and links for every sensor.
+	// Observed by: session.add.
+	windowComputeSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "window_compute_seconds",
+		Help:    "Time to compute one 2-second window of one session.",
+		Buckets: prometheus.ExponentialBuckets(0.0001, 2, 12), // 0.1 ms to about 0.2 s
+	})
+	// missingBatches counts jumps in seq. Raised by: processor.handle.
+	missingBatches = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "missing_batches_total",
+		Help: "Gaps in a session's batch sequence.",
+	})
+	// duplicateBatches counts batches dropped as already seen. Raised by: processor.handle.
+	duplicateBatches = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "duplicate_batches_total",
+		Help: "Batches dropped because their seq was already processed.",
+	})
 )
 
 const (
@@ -126,9 +149,11 @@ func (p *processor) handle(ctx context.Context, rec *kgo.Record) error {
 	switch {
 	case res.duplicate:
 		p.duplicates++
+		duplicateBatches.Inc()
 		return nil
 	case res.gap:
 		p.missing++
+		missingBatches.Inc()
 		log.Printf("session %s: gap before seq %d, buffers cleared", s.id, batch.Seq)
 	}
 	for _, f := range res.frames {
@@ -221,13 +246,7 @@ func main() {
 		log.Printf("links on, sensors at least %.0f degrees apart", links.minAngleDeg)
 	}
 
-	go func() {
-		mux := http.NewServeMux()
-		mux.Handle("/metrics", promhttp.Handler())
-		if err := http.ListenAndServe(env("METRICS_ADDR", ":9100"), mux); err != nil {
-			log.Printf("metrics: %v", err)
-		}
-	}()
+	metrics.Serve(env("METRICS_ADDR", ":9100"))
 
 	kafka, err := kgo.NewClient(
 		kgo.SeedBrokers(strings.Split(env("KAFKA_BROKERS", "localhost:29092"), ",")...),

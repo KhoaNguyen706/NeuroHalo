@@ -1,0 +1,18 @@
+# Prometheus reads each service's /metrics every 5 seconds.
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: gateway
+    static_configs:
+      - targets: ["gateway:9100"]
+  - job_name: processor
+    static_configs:
+      - targets: ["processor:9100"]
+  - job_name: api
+    static_configs:
+      - targets: ["api:9100"]
+  # Consumer lag per group, read from Kafka by kafka-exporter.
+  - job_name: kafka
+    static_configs:
+      - targets: ["kafka-exporter:9308"]

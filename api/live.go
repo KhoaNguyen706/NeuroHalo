@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"google.golang.org/protobuf/proto"
 
@@ -29,6 +31,31 @@ const (
 	wsWriteTimeout    = 5 * time.Second
 	wsPingEvery       = 30 * time.Second
 )
+
+// pipelineLatencySeconds is how long a frame took to get here: from the
+// moment the sender sent the newest batch in its window, through the gateway,
+// both Kafka hops and the processor.
+// Observed by: runLiveConsumer.
+var pipelineLatencySeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "pipeline_latency_seconds",
+	Help:    "Time from a batch being sent to its feature frame reaching the api.",
+	Buckets: prometheus.ExponentialBuckets(0.001, 2, 15), // 1 ms to about 16 s
+})
+
+// registerLiveMetrics exposes two numbers the api already keeps: open
+// WebSockets (ws_clients) and frames skipped for slow viewers
+// (ws_frames_dropped_total).
+// Used by: main.
+func registerLiveMetrics(a *api) {
+	promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "ws_clients",
+		Help: "WebSocket viewers connected right now.",
+	}, func() float64 { return float64(a.wsClients.Load()) })
+	promauto.NewCounterFunc(prometheus.CounterOpts{
+		Name: "ws_frames_dropped_total",
+		Help: "Frames replaced by a newer one before a slow viewer took them.",
+	}, func() float64 { return float64(a.hub.framesDropped.Load()) })
+}
 
 // viewer is one open WebSocket. It holds at most one frame: a slow viewer
 // skips to the newest frame and never slows the others down.
@@ -219,6 +246,7 @@ func runLiveConsumer(ctx context.Context, brokers []string, h *hub) error {
 			}
 			var f neurov1.FeatureFrame
 			if proto.Unmarshal(rec.Value, &f) == nil {
+				pipelineLatencySeconds.Observe(time.Since(time.Unix(0, f.NewestSentTimeUnixNanos)).Seconds())
 				h.publishFrame(&f)
 			}
 		})

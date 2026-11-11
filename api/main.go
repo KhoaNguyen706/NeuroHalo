@@ -15,6 +15,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/twmb/franz-go/pkg/kgo"
+
+	"github.com/neurohalo/neurohalo/internal/metrics"
 )
 
 // env returns an environment variable, or fallback when it is unset or empty.
@@ -26,7 +28,8 @@ func env(name, fallback string) string {
 }
 
 // main connects to Postgres, Kafka and the object store, starts the store
-// consumer, the live consumer and the HTTP server, and runs until Ctrl+C or
+// consumer, the live consumer, the HTTP server and Prometheus metrics on
+// METRICS_ADDR, and runs until Ctrl+C or
 // SIGTERM. If the store consumer fails, the process exits so the container
 // restarts and resumes from the last commit.
 func main() {
@@ -66,6 +69,8 @@ func main() {
 		hub:     newHub(),
 		origins: strings.Split(env("WEB_ORIGIN", "http://localhost:3000"), ","),
 	}
+	registerLiveMetrics(a)
+	metrics.Serve(env("METRICS_ADDR", ":9100"))
 
 	if endpoint := os.Getenv("S3_ENDPOINT"); endpoint != "" {
 		a.objects, err = newObjectStore(endpoint, os.Getenv("S3_ACCESS_KEY"), os.Getenv("S3_SECRET_KEY"),

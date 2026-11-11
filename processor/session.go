@@ -134,7 +134,9 @@ func (s *session) add(b *neurov1.SampleBatch) batchResult {
 		// no matter which processor computes it or when it restarted.
 		sampleCount := b.FirstSampleIndex + uint64(row) + 1
 		if s.filled == s.win && sampleCount%uint64(s.hop) == 0 {
+			began := time.Now()
 			frame := s.compute(sampleCount/uint64(s.hop), b.SentTimeUnixNanos)
+			windowComputeSeconds.Observe(time.Since(began).Seconds())
 			res.frames = append(res.frames, frame)
 			res.events = append(res.events, s.detect(frame)...)
 		}

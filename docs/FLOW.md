@@ -47,6 +47,8 @@ A session can start three ways, and all three feed the same pipeline: a built-in
 | signal math | `internal/eeg/` | FFT, band power, quality rules; shared by processor and api |
 | contract | `proto/neuro/v1/` | The message formats every piece agrees on |
 | featuretail | `tools/featuretail/` | Terminal viewer for what the processor writes (debugging only) |
+| loadgen | `tools/loadgen/` | Holds many streams open at once, to measure the pipeline |
+| monitoring | `monitoring/` | Prometheus and Grafana settings, and the dashboard |
 
 ## What travels between them
 
@@ -464,12 +466,49 @@ curl -H "Authorization: Bearer dev-token" http://localhost:8080/sessions
 | Regenerate code after editing a `.proto` | `scripts/gen.ps1` |
 | Look inside an EDF file | `uv run inspect_edf.py ../data/S001R01.edf` |
 
+# Metrics and load test
+
+Each Go service answers `GET /metrics` on port 9100 (`internal/metrics.Serve`), reachable only inside the Compose network. Prometheus (http://localhost:9090) reads them every 5 seconds. Grafana (http://localhost:3001) opens on the "NeuroHalo pipeline" dashboard, which is the file `monitoring/grafana/dashboards/pipeline.json`.
+
+| Service | Metric | Where it is updated |
+| --- | --- | --- |
+| gateway | `ingest_batches_total`, `ingest_bytes_total` | `server.publish`, after Kafka confirms |
+| gateway | `active_streams` | `server.Stream` |
+| gateway | `rejected_batches_total{reason}` | `validateBatch`, `server.Stream` |
+| processor | `window_compute_seconds` | `session.add`, around `compute` |
+| processor | `links_compute_seconds` | `session.compute` |
+| processor | `missing_batches_total`, `duplicate_batches_total` | `processor.handle` |
+| api | `pipeline_latency_seconds` | `runLiveConsumer`, for every frame |
+| api | `ws_clients`, `ws_frames_dropped_total` | `registerLiveMetrics` reads the api's own counters |
+| Kafka | `kafka_consumergroup_lag` | the `kafka-exporter` container |
+
+**Pipeline latency** is the time the api receives a frame minus the moment the sender sent the newest batch in that frame's window. It covers the gateway, both Kafka hops and the processor.
+
+**Load generator (`tools/loadgen`).** Go has no EDF reader, so `replayer/make_loadgen_data.py` converts one recording once into `data/loadgen/recording.f32` plus a small JSON header. `loadgen` then opens N streams (100 per TCP connection), started evenly over the ramp time, and replays that recording on each at real speed. Its sessions have source `loadgen`; `GET /sessions` leaves them out.
+
+```powershell
+cd replayer; uv run make_loadgen_data.py; cd ..     # once
+scripts/loadtest.ps1                                # 10, 100, 500 and 1,000 sessions, 60 s each
+docker compose run --rm loadgen -sessions 200 -duration 2m   # one run by hand
+```
+
+`scripts/loadtest.ps1` prints one row per run from Prometheus and then deletes the test sessions.
+
+Measured on 2026-11-10, everything on one Windows laptop in Docker Desktop (one gateway, one processor, one api, one Kafka broker), 64 channels at 160 Hz per session:
+
+| Sessions | Batches/s | MB/s | p50 latency | p99 latency | Max processor lag | Gaps |
+| --- | --- | --- | --- | --- | --- | --- |
+| 10 | 100 | 0.41 | 13 ms | 32 ms | 0 | 0 |
+| 100 | 1,000 | 4.1 | 26 ms | 63 ms | 0 | 0 |
+| 500 | 5,000 | 20.7 | 27 ms | 63 ms | 111 | 0 |
+| 1,000 | 10,000 | 41.4 | 50 ms | 170 ms | 496 | 0 |
+
+No stream failed and no batch was sent late in any run. The percentiles are estimated from histogram buckets that double in width (… 32, 64, 128, 256 ms), so they are accurate to within a bucket, not to the millisecond. p99 starts climbing between 500 and 1,000 sessions. Each run was 60 seconds; a longer run has not been done.
+
 # Not built yet
 
 | Step | What |
 | --- | --- |
-| 8 | Prometheus metrics, Grafana |
-| 9 | Go load generator |
 | 10 | Kubernetes on kind |
 | 11 | Summarizer and MCP server |
 | 12 | README, demo video, AWS run |
