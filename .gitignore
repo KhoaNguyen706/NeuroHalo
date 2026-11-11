@@ -16,3 +16,8 @@ bin/
 !.env.example
 *.pem
 *.key
+
+# Terraform working files and state (state can hold secrets)
+.terraform/
+*.tfstate
+*.tfstate.*

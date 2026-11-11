@@ -241,6 +241,7 @@ flowchart TD
 | `channel_bad` | A sensor that is not bad is non-OK for 3 windows in a row. It also fires again when a bad sensor's reason changes (noisy ↔ flat) for 3 windows in a row |
 | `channel_recovered` | A bad sensor is OK for 3 windows in a row |
 | `alpha_rise` | Mean back-of-head alpha is above 1.5 × the session's running average for 4 windows. It needs 10 windows of history first, and fires once per rise |
+| `eye_movement`, `muscle` | See "Eye movements and muscle activity" below |
 
 The event time is `windowTime(windowIndex)`, which is recording time (see "Two clocks").
 
@@ -547,10 +548,76 @@ Measured on 2026-11-10, everything on one Windows laptop in Docker Desktop (one 
 
 No stream failed and no batch was sent late in any run. The percentiles are estimated from histogram buckets that double in width (… 32, 64, 128, 256 ms), so they are accurate to within a bucket, not to the millisecond. p99 starts climbing between 500 and 1,000 sessions. Each run was 60 seconds; a longer run has not been done.
 
+# Killing a processor
+
+The processors share the 12 partitions of `eeg.raw` as consumer group `processor`. When one dies without warning, Kafka waits 10 seconds (`sessionTimeout` in `processor/main.go`) and then gives its partitions to the others. A survivor starts each taken-over session from the last committed offset with an empty buffer, so it sends frames again after 2 seconds of data. Nothing is lost in Kafka; the frames the dead processor had not yet committed are computed again, and the api drops the repeats.
+
+```powershell
+scripts/failover.ps1          # Docker Compose: 2 processors, 200 sessions, kill one after 40 s
+```
+
+Measured on 2026-11-10 with 200 sessions: no stream failed, no gap was counted, the backlog peaked at 13,322 batches and was gone 20 seconds after the kill, and frames were back at 400 a second.
+
+# Kubernetes
+
+`deploy/helm/neurohalo` is a Helm chart for the whole stack: Kafka with a Job that creates the topics, Postgres, file storage, and the five NeuroHalo programs, with two processor replicas. `deploy/kind.yaml` describes a one-node local cluster (kind) that publishes the app on the same localhost ports as Docker Compose.
+
+```powershell
+scripts/k8s.ps1 up      # stops Compose, creates the cluster, loads the images, installs the chart
+scripts/k8s.ps1 demo    # 6 sessions, kills a processor pod mid-way, reports what was stored
+scripts/k8s.ps1 down    # deletes the cluster, starts Compose again
+```
+
+Things the chart has to get right:
+- Topics are created by a Job and automatic creation is off, so gateway, processor and api each wait in an init container until the topics exist.
+- Every pod sets `enableServiceLinks: false`. Otherwise Kubernetes sets `KAFKA_PORT` for the Service named `kafka`, and the Kafka image reads that as a broker setting.
+- The schema comes from a ConfigMap that the script makes from `db/schema.sql`, so it lives in one place.
+- Kafka, Postgres and file storage keep their data inside the pod. That is enough for a local cluster and nothing more.
+- Prometheus and Grafana are not in the chart.
+
+Measured on 2026-11-10: six 61-second sessions, one of the two processor pods force-deleted 30 seconds in. Kubernetes had a replacement running within 5 seconds. All six sessions finished. Four stored all 119 frames; the two that were on the killed pod stored 111 each, so they lost 4 seconds of frames while Kafka moved their partitions and the buffer refilled.
+
+# AWS (not run)
+
+`deploy/terraform/main.tf` describes a short run on AWS: one EC2 machine with a fixed public address that clones the repository and starts the Docker Compose stack, reachable only from the address range given as `allowed_cidr`. It passes `terraform validate`. It has never been applied, so nothing in it has been tested against a real AWS account.
+
+# CI
+
+`.github/workflows/ci.yml` runs on every push to `main` and every pull request: Go formatting, `go vet` and tests; the web app's type check and build; every Docker image; `helm lint`; and `terraform validate`.
+
+# Live input (Lab Streaming Layer)
+
+LSL is how EEG amplifiers publish samples on a local network. `replayer/lsl_bridge.py` finds an LSL stream of type EEG and forwards it to the gateway as a session with source `lsl`, in the same 100 ms batches the replayer sends.
+
+1. `channel_layout()` reads the channel names and the unit from the stream's description. Names go through `normalize_channel_name`; values are scaled to microvolts.
+2. `Bridge.requests()` yields the header, then one batch for every 100 ms of samples pulled from the stream.
+3. When the gateway connection breaks, the next stream sends the last 10 batches again (the processor drops the ones that did arrive) and carries on with `seq`.
+4. After 5 seconds without a sample the stream is closed, which ends the session.
+
+`replayer/lsl_sim.py` publishes a recording as an LSL stream, standing in for an amplifier. Both run on the host, not in Docker, because LSL finds streams with multicast on the local network.
+
+```powershell
+cd replayer
+uv run --group lsl lsl_sim.py            # terminal 1: the pretend amplifier
+uv run --group lsl lsl_bridge.py         # terminal 2: the session appears on the home page
+```
+
+Tested with the simulator only. No real amplifier has been connected.
+
+# Eye movements and muscle activity
+
+`processor/artifacts.go` flags two kinds of signal that come from the body, not the brain. Each is one event when it starts.
+
+| Event | Rule in the code |
+| --- | --- |
+| `eye_movement` | The average of `Fp1`, `Fp2` and `Fpz`, smoothed over 0.1 s, swings more than 100 µV within the newest 0.5 s, and at least 3 times as much as the back of the head does |
+| `muscle` | Gamma (30 to 45 Hz) is above 30% of a sensor's power on at least 3 good sensors, for 2 windows in a row |
+
+The 0.1-second smoothing also removes mains hum, which is strong in the sample recordings. The thresholds were set on those recordings (eyes open: 8 eye events a minute; eyes closed: 3 to 6, since eyes also move under closed lids). They are rules of thumb and have not been checked against hand-labelled data. The session page lists both events in the rail; they get no tick on the chart.
+
 # Not built yet
 
 | Step | What |
 | --- | --- |
-| 10 | Kubernetes on kind |
 | 11 | Summarizer and MCP server |
-| 12 | README, demo video, AWS run |
+| 12 | Demo video, and the AWS run itself (the Terraform file exists; it has not been applied) |

@@ -1,0 +1,35 @@
+# Images are built by Docker Compose and loaded into the cluster by
+# scripts/k8s.ps1, which tags them neurohalo-<service>:<imageTag>.
+imageTag: dev
+
+# The token clients send to the gateway and the api. The web image has its
+# token baked in at build time, so the two must match.
+token: dev-token
+
+# Where browsers reach the web app; the api allows this origin.
+webOrigin: http://localhost:3000
+
+processor:
+  replicas: 2          # two, so one can be killed while sessions are live
+  linksEnabled: false
+
+# The ports published on the node; deploy/kind.yaml maps them to localhost.
+nodePorts:
+  web: 30300
+  api: 30080
+  gateway: 30051
+
+# The ConfigMap holding db/schema.sql. scripts/k8s.ps1 creates it from the
+# file, so the schema lives in one place.
+schemaConfigMap: db-schema
+
+# Development credentials, the same ones Docker Compose uses. Fine on a
+# laptop; replace with Secrets before running anywhere shared.
+postgres:
+  user: neuro
+  password: neuro
+  database: neuro
+storage:
+  accessKey: neuro
+  secretKey: neuro-dev-secret
+  bucket: recordings

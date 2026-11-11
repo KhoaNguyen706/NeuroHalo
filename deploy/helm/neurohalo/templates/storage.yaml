@@ -1,0 +1,40 @@
+# S3-compatible file storage for uploaded recordings (SeaweedFS).
+apiVersion: v1
+kind: Service
+metadata:
+  name: storage
+spec:
+  selector: { app: storage }
+  ports:
+    - port: 8333
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: storage
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: storage }
+  template:
+    metadata:
+      labels: { app: storage }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: storage
+          image: chrislusf/seaweedfs:4.53
+          ports:
+            - containerPort: 8333
+          env:
+            - { name: S3_ACCESS_KEY, value: {{ .Values.storage.accessKey | quote }} }
+            - { name: S3_SECRET_KEY, value: {{ .Values.storage.secretKey | quote }} }
+          command:
+            - /bin/sh
+            - -c
+            - |
+              printf '{"identities":[{"name":"neuro","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","Write","List","Tagging"]}]}' \
+                "$S3_ACCESS_KEY" "$S3_SECRET_KEY" > /tmp/s3.json
+              exec weed server -dir=/data -ip.bind=0.0.0.0 -master.volumeSizeLimitMB=1024 -volume.max=0 \
+                -s3 -s3.port=8333 -s3.config=/tmp/s3.json

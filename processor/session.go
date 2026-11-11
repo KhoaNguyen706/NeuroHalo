@@ -58,6 +58,14 @@ type session struct {
 	alphaCount int
 	alphaAbove int
 
+	// Artifacts (artifacts.go): the sensors above the eyes, scratch space for
+	// groupSwing, whether the last window held an eye movement, and how many
+	// windows in a row showed muscle activity.
+	frontPole  []int
+	eyeScratch []float64
+	eyeActive  bool
+	muscleRun  int
+
 	lastSeen time.Time
 }
 
@@ -83,6 +91,9 @@ func newSession(id string, sampleRateHz float64, names []string, startedAt time.
 		sameRun:   make([]int, n),
 		bad:       make([]bool, n),
 		badQ:      make([]neurov1.Quality, n),
+
+		frontPole:  frontPoleSensors(names),
+		eyeScratch: make([]float64, win),
 	}
 	if links != nil {
 		s.linkPairs = links.allowedPairs(names)
@@ -138,7 +149,8 @@ func (s *session) add(b *neurov1.SampleBatch) batchResult {
 			frame := s.compute(sampleCount/uint64(s.hop), b.SentTimeUnixNanos)
 			windowComputeSeconds.Observe(time.Since(began).Seconds())
 			res.frames = append(res.frames, frame)
-			res.events = append(res.events, s.detect(frame)...)
+			eye, eyeSwing := s.eyeMovement()
+			res.events = append(res.events, s.detect(frame, eye, eyeSwing)...)
 		}
 	}
 	return res
@@ -179,9 +191,10 @@ func (s *session) windowTime(windowIndex uint64) time.Time {
 }
 
 // detect turns one frame into events: a sensor going bad or recovering, a bad
-// sensor changing reason (noisy to flat, or back), and alpha rising over the
-// back of the head.
-func (s *session) detect(f *neurov1.FeatureFrame) []*neurov1.Event {
+// sensor changing reason (noisy to flat, or back), alpha rising over the
+// back of the head, and the start of an eye movement or of muscle activity.
+// eye and eyeSwing come from eyeMovement for the same window.
+func (s *session) detect(f *neurov1.FeatureFrame, eye bool, eyeSwing float64) []*neurov1.Event {
 	var events []*neurov1.Event
 	at := s.windowTime(f.WindowIndex).UnixNano()
 	emit := func(kind, channel string, details map[string]any) {
@@ -252,6 +265,23 @@ func (s *session) detect(f *neurov1.FeatureFrame) []*neurov1.Event {
 		}
 		s.alphaSum += alpha
 		s.alphaCount++
+	}
+
+	// Artifacts fire once, when they start.
+	if eye && !s.eyeActive {
+		emit("eye_movement", "", map[string]any{"frontal_uv": math.Round(eyeSwing), "window": f.WindowIndex})
+	}
+	s.eyeActive = eye
+
+	if tense := s.muscleSensors(f); len(tense) >= muscleMinSensors {
+		s.muscleRun++
+		if s.muscleRun == muscleAfterWindows {
+			emit("muscle", "", map[string]any{
+				"sensors": len(tense), "channels": tense[:min(len(tense), muscleListed)], "window": f.WindowIndex,
+			})
+		}
+	} else {
+		s.muscleRun = 0
 	}
 	return events
 }

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: neurohalo
+description: The NeuroHalo pipeline (gateway, processor, api, worker, web) with Kafka, Postgres and file storage.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

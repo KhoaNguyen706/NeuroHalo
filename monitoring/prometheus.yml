@@ -6,9 +6,14 @@ scrape_configs:
   - job_name: gateway
     static_configs:
       - targets: ["gateway:9100"]
+  # There can be several processors (docker compose up --scale processor=2);
+  # the name resolves to all of them.
   - job_name: processor
-    static_configs:
-      - targets: ["processor:9100"]
+    dns_sd_configs:
+      - names: ["processor"]
+        type: A
+        port: 9100
+        refresh_interval: 5s
   - job_name: api
     static_configs:
       - targets: ["api:9100"]

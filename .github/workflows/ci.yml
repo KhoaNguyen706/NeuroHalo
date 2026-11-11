@@ -1,0 +1,62 @@
+# Checks every push and pull request: Go tests, the web app's types and
+# build, every Docker image, and the Helm chart and Terraform file.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    name: Go tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Formatting
+        run: test -z "$(gofmt -l api gateway processor internal tools)"
+      - run: go vet ./...
+      - run: go test ./...
+
+  web:
+    name: Web app
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --no-fund --no-audit
+      - run: npm run typecheck
+      - run: npm run build
+
+  images:
+    name: Docker images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose --profile tools build
+
+  deploy-files:
+    name: Helm chart and Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint deploy/helm/neurohalo
+      - run: helm template neurohalo deploy/helm/neurohalo > /dev/null
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform
+        working-directory: deploy/terraform
+        run: |
+          terraform fmt -check
+          terraform init -backend=false
+          terraform validate

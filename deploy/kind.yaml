@@ -1,0 +1,12 @@
+# A one-node Kubernetes cluster inside Docker (kind), with the app's three
+# ports published on the same localhost ports Docker Compose uses.
+#   scripts/k8s.ps1 up
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: neurohalo
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - { containerPort: 30300, hostPort: 3000 }   # web
+      - { containerPort: 30080, hostPort: 8080 }   # api
+      - { containerPort: 30051, hostPort: 50051 }  # gateway (gRPC)

@@ -52,6 +52,7 @@ const (
 	eventsTopic   = "eeg.events"
 	group         = "processor"
 
+	sessionTimeout = 10 * time.Second
 	idleSessionTTL = 10 * time.Minute
 	statsEvery     = 10 * time.Second
 )
@@ -253,6 +254,9 @@ func main() {
 		kgo.ConsumerGroup(group),
 		kgo.ConsumeTopics(rawTopic),
 		kgo.DisableAutoCommit(),
+		// When a processor dies without saying goodbye, Kafka waits this long
+		// before giving its partitions to the others (the default is 45 s).
+		kgo.SessionTimeout(sessionTimeout),
 	)
 	if err != nil {
 		log.Fatalf("kafka: %v", err)

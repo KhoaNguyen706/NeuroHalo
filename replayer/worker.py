@@ -64,19 +64,34 @@ def finish(session_id: str, status: str, error: str = "") -> None:
         )
 
 
+# Held while a sample is looked up or downloaded, so jobs that start together
+# and need the same missing file download it once, not once each into the
+# same temporary file.
+# Used by: sample_path.
+DOWNLOAD_LOCK = threading.Lock()
+
+
 def sample_path(name: str) -> Path:
     """Find a sample recording on disk, downloading it into the cache the first
     time. Only names like S001R02.edf are accepted."""
     m = SAMPLE_FILE.match(name)
     if not m:
         raise ValueError(f"not a sample file name: {name!r}")
+    with DOWNLOAD_LOCK:
+        return _find_or_download(name, m.group(1))
+
+
+def _find_or_download(name: str, subject: str) -> Path:
+    """Return the sample's path in the sample folders or the cache, fetching
+    it from PhysioNet into the cache when it is in neither. Called with
+    DOWNLOAD_LOCK held."""
     for d in [*SAMPLE_DIRS, CACHE_DIR]:
         if (d / name).is_file():
             return d / name
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     target = CACHE_DIR / name
     partial = target.with_suffix(".part")
-    url = PHYSIONET.format(subject=m.group(1), name=name)
+    url = PHYSIONET.format(subject=subject, name=name)
     log.info("downloading sample %s", url)
     with urllib.request.urlopen(url, timeout=60) as resp, open(partial, "wb") as out:
         while chunk := resp.read(1 << 20):

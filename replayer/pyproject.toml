@@ -15,3 +15,6 @@ dev = [
     "grpcio-tools>=1.85.1",
     "nibabel>=5.5.0",
 ]
+lsl = [
+    "pylsl>=1.18.6",
+]

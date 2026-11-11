@@ -46,8 +46,12 @@ const EVENT_WORD: Record<string, string> = {
   channel_bad: "bad",
   channel_recovered: "recovered",
   alpha_rise: "Alpha rise",
+  eye_movement: "Eye movement",
+  muscle: "Muscle activity",
 };
 
+// Events that get a tick on the chart. Eye movements and muscle activity are
+// listed in the rail only: there are several a minute, too many for ticks.
 const MARK_KIND: Record<string, Mark["kind"]> = {
   channel_bad: "bad",
   channel_recovered: "recovered",

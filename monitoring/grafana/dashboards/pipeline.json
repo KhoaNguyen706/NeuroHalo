@@ -370,7 +370,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(missing_batches_total[30s])",
+          "expr": "sum(rate(missing_batches_total[30s]))",
           "legendFormat": "gaps"
         },
         {
@@ -379,7 +379,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(duplicate_batches_total[30s])",
+          "expr": "sum(rate(duplicate_batches_total[30s]))",
           "legendFormat": "duplicates"
         },
         {

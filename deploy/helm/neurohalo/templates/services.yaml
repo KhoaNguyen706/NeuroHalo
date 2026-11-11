@@ -1,0 +1,173 @@
+# The five NeuroHalo programs: gateway, processor, api, worker and web.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+spec:
+  type: NodePort
+  selector: { app: gateway }
+  ports:
+    - { name: grpc, port: 50051, nodePort: {{ .Values.nodePorts.gateway }} }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: gateway }
+  template:
+    metadata:
+      labels: { app: gateway }
+    spec:
+      enableServiceLinks: false
+      initContainers:
+        {{- include "neurohalo.waitForTopics" . | nindent 8 }}
+      containers:
+        - name: gateway
+          image: neurohalo-gateway:{{ .Values.imageTag }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 50051
+            - { name: metrics, containerPort: 9100 }
+          env:
+            - { name: INGEST_TOKEN, value: {{ .Values.token | quote }} }
+            - { name: KAFKA_BROKERS, value: "kafka:9092" }
+            - { name: DATABASE_URL, value: {{ include "neurohalo.databaseUrl" . | quote }} }
+---
+# The processor has no Service: nothing calls it. It reads Kafka as consumer
+# group "processor", so the replicas share the partitions of eeg.raw, and
+# when one dies Kafka gives its partitions to the others.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: processor
+spec:
+  replicas: {{ .Values.processor.replicas }}
+  selector:
+    matchLabels: { app: processor }
+  template:
+    metadata:
+      labels: { app: processor }
+    spec:
+      enableServiceLinks: false
+      initContainers:
+        {{- include "neurohalo.waitForTopics" . | nindent 8 }}
+      containers:
+        - name: processor
+          image: neurohalo-processor:{{ .Values.imageTag }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: metrics, containerPort: 9100 }
+          env:
+            - { name: KAFKA_BROKERS, value: "kafka:9092" }
+            - { name: DATABASE_URL, value: {{ include "neurohalo.databaseUrl" . | quote }} }
+            - { name: LINKS_ENABLED, value: {{ .Values.processor.linksEnabled | quote }} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  type: NodePort
+  selector: { app: api }
+  ports:
+    - { name: http, port: 8080, nodePort: {{ .Values.nodePorts.api }} }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: api }
+  template:
+    metadata:
+      labels: { app: api }
+    spec:
+      enableServiceLinks: false
+      initContainers:
+        {{- include "neurohalo.waitForTopics" . | nindent 8 }}
+      containers:
+        - name: api
+          image: neurohalo-api:{{ .Values.imageTag }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+            - { name: metrics, containerPort: 9100 }
+          env:
+            - { name: API_TOKEN, value: {{ .Values.token | quote }} }
+            - { name: KAFKA_BROKERS, value: "kafka:9092" }
+            - { name: DATABASE_URL, value: {{ include "neurohalo.databaseUrl" . | quote }} }
+            - { name: S3_ENDPOINT, value: "storage:8333" }
+            - { name: S3_ACCESS_KEY, value: {{ .Values.storage.accessKey | quote }} }
+            - { name: S3_SECRET_KEY, value: {{ .Values.storage.secretKey | quote }} }
+            - { name: S3_BUCKET, value: {{ .Values.storage.bucket | quote }} }
+            - { name: WEB_ORIGIN, value: {{ .Values.webOrigin | quote }} }
+---
+# The replay worker. Samples are downloaded from PhysioNet on first use and
+# kept in the pod's cache folder.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: worker }
+  template:
+    metadata:
+      labels: { app: worker }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: worker
+          image: neurohalo-worker:{{ .Values.imageTag }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: DATABASE_URL, value: "postgresql://{{ .Values.postgres.user }}:{{ .Values.postgres.password }}@postgres:5432/{{ .Values.postgres.database }}" }
+            - { name: GATEWAY, value: "gateway:50051" }
+            - { name: INGEST_TOKEN, value: {{ .Values.token | quote }} }
+            - { name: S3_ENDPOINT, value: "storage:8333" }
+            - { name: S3_ACCESS_KEY, value: {{ .Values.storage.accessKey | quote }} }
+            - { name: S3_SECRET_KEY, value: {{ .Values.storage.secretKey | quote }} }
+            - { name: S3_BUCKET, value: {{ .Values.storage.bucket | quote }} }
+            - { name: SAMPLE_DIRS, value: "/samples" }
+            - { name: CACHE_DIR, value: "/cache" }
+          volumeMounts:
+            - { name: cache, mountPath: /cache }
+      volumes:
+        - name: cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  type: NodePort
+  selector: { app: web }
+  ports:
+    - { name: http, port: 3000, nodePort: {{ .Values.nodePorts.web }} }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: web }
+  template:
+    metadata:
+      labels: { app: web }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: web
+          image: neurohalo-web:{{ .Values.imageTag }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
