@@ -2,7 +2,7 @@
 
 This file follows the data through the code. The **high-level** part shows the pieces and what travels between them. The **low-level** part walks through each program function by function, in the order they run.
 
-The reasons behind the design live in [`NeuroHalo v1 Low-Level Design.md`](../NeuroHalo%20v1%20Low-Level%20Design.md). This file describes what the code does today: build steps 1 to 6, plus samples and uploads.
+The reasons behind the design live in [`NeuroHalo v1 Low-Level Design.md`](../NeuroHalo%20v1%20Low-Level%20Design.md). This file describes what the code does today: build steps 1 to 9, plus samples and uploads.
 
 ---
 
@@ -287,8 +287,9 @@ flowchart TD
 
 | Request | Handler | Query |
 | --- | --- | --- |
-| `GET /sessions` | `listSessions` | newest 100 by `started_at` |
+| `GET /sessions` | `listSessions` | newest 100 by `started_at`, load-test sessions left out |
 | `GET /sessions/{id}` | `getSession` | one row, 404 if missing |
+| `DELETE /sessions/{id}` | `deleteSession` | removes an ended session with its events, rollups and replay job in one transaction; 409 while it is live |
 | `GET /sessions/{id}/events` | `listEvents` | `ORDER BY at, id` |
 | `GET /sessions/{id}/rollups?from=&to=` | `listRollups` | `from <= bucket_start < to`, both optional (RFC 3339), plus the band names |
 
@@ -312,11 +313,14 @@ sequenceDiagram
     A->>B: {"type":"event", …}
 ```
 
-1. `runLiveConsumer()` reads every partition of `eeg.features` and `eeg.events`, starting from the newest message. It uses no consumer group and commits nothing, so every api instance sees every frame.
+1. `runLiveConsumer()` reads every partition of `eeg.features`, `eeg.events` and `eeg.raw`, starting from the newest message. It uses no consumer group and commits nothing, so every api instance sees every frame. A raw batch is only decoded when a viewer of that session asked for raw signal (`hub.wantsRaw`, decided from the message key).
 2. The `hub` maps a session ID to its viewers. `publishFrame()` calls `viewer.offerFrame()`.
 3. Each `viewer` has a **one-frame slot**. If the slot still holds an unsent frame, the new frame replaces it and `framesDropped` goes up. A slow viewer therefore skips to the newest frame and never slows anyone else.
 4. `liveSession()` handles one WebSocket. A reader goroutine takes `subscribe` messages and stores the band. The write loop sends frames (cut down to that band by `frameMessage()`), events, and a ping every 30 s.
 5. Browsers cannot set headers on a WebSocket, so `requireToken()` accepts `?token=` on `/ws/` paths. The `Origin` header must match `WEB_ORIGIN`.
+6. The `subscribe` message has two optional parts:
+   - `"links": true` adds a `links` message after each frame: the window's strongest correlated sensor pairs as `[a, b, strength]`. The processor only computes them when `LINKS_ENABLED` is on (`processor/links.go`): Pearson correlation over the 2-second window, for pairs at least `MIN_LINK_ANGLE_DEG` apart on the head, strongest 50 kept.
+   - `"raw": [3, 10]` adds a `raw` message ten times a second with the samples of those channels (at most 8), cut out of the raw batch by `rawMessage()`.
 
 ### Samples and uploads (`api/uploads.go`, `api/edf.go`)
 
@@ -326,6 +330,7 @@ sequenceDiagram
 | `POST /samples/{name}/play?speed=1x\|fast` | `playSample` | Queues a replay of a sample; returns the new session ID |
 | `POST /uploads` (multipart `file`, `speed`) | `upload` | Checks, stores and queues an uploaded EDF; returns the session ID and what the header says |
 | `GET /replays/{id}` | `getReplay` | The job's state: queued, running, done or failed with a message |
+| `POST /sessions/{id}/replay?from=&to=&speed=` | `replayFrom` | Queues a new replay of the recording behind an earlier session, from `from` seconds to `to` seconds; returns the new session ID |
 
 `upload()` runs these checks in order and stops at the first failure:
 1. The body is at most 50 MB (`http.MaxBytesReader`); otherwise 413.
@@ -351,59 +356,96 @@ The session row itself does not exist yet. The gateway creates it when the worke
 | File | Job |
 | --- | --- |
 | `src/lib/api.ts` | REST calls, the WebSocket address, and the types of every answer |
-| `src/app/page.tsx` | Home: upload area, sample list, session list (refreshed every 3 s) |
-| `src/app/sessions/[id]/page.tsx` | The live session page: layout, band selector, event list, popover |
+| `src/app/page.tsx` | Home: upload area, sample list, session list (refreshed every 3 s) with delete, theme switch |
+| `src/app/sessions/[id]/page.tsx` | The session page: layout, rail, popover, chart lines, history playhead, replay form |
 | `src/app/sessions/[id]/page.module.css` | That page's styles |
 | `src/hooks/useLiveSession.ts` | All WebSocket logic |
-| `src/components/HeadScene.tsx` | The 3D scene of the live session page |
+| `src/hooks/useBaseline.ts` | Each sensor's band strength over the session's first 30 seconds, from the stored rollups |
+| `src/components/HeadScene.tsx` | The 3D scene of the session page: brain, sensor dots, rings, correlation lines |
+| `src/components/Timeline.tsx` | The band strength chart under the head |
+| `src/components/RawTraces.tsx` | The scrolling raw signal, and one sensor's frequency spectrum |
+| `src/components/SensorMap.tsx` | The flat map of the head seen from above |
+| `src/lib/regions.ts` | Brain region and side from a sensor's name (`F3` is frontal, left) |
+| `src/lib/export.ts` | The two CSV downloads |
+| `src/lib/theme.ts`, `src/components/ThemeToggle.tsx` | Light and dark theme |
 | `src/positions.json` | Sensor name → x, y, z, generated once by `replayer/make_positions.py` |
-| `src/components/Head3D.tsx`, `src/lib/model.ts`, `src/lib/color.ts`, `public/model/` | The turning brain on the home page only |
+| `src/lib/model.ts`, `public/model/` | The brain and head surfaces (FreeSurfer fsaverage), generated once by `replayer/make_head_model.py` |
+| `src/components/Head3D.tsx`, `src/lib/color.ts` | The turning brain on the home page |
 
-### Live session page
+### Session page
 
-The page is the 3D head, a 320 px rail (band selector, event list) and three small readouts in the top-left corner: session name, elapsed time, delay. Nothing else.
+The page has two columns. On the left: the 3D head with three small readouts in its top-left corner (session name, elapsed time, delay), the chart under it, and the raw signal under that when it is switched on. On the right, a 320 px rail: data quality, the band selector, three toggles (Signal correlation, Raw signal, Sensor map), the replay form for an ended session, the event list and the CSV exports.
+
+The page works in two modes, chosen by the session's status.
+
+| | Live session | Ended session |
+| --- | --- | --- |
+| Head and chart show | Frames from the WebSocket, twice a second | The stored 10-second rollups (`GET /sessions/{id}/rollups`) |
+| Moving through time | Not possible; it shows now | A click or drag on the chart moves a playhead |
+| Events | Stored ones (`GET /sessions/{id}/events`) plus new ones from the WebSocket | Stored ones |
+| Correlation, raw signal | Available | Off: neither is stored |
+| Replay | — | "Replay from … to …" starts a new live session over that stretch |
 
 ```mermaid
 sequenceDiagram
-    participant P as SessionPage
+    participant P as SessionView
     participant H as useLiveSession
     participant S as HeadScene
     participant A as api
     P->>A: GET /sessions/{id} (retried every second until it exists)
-    P->>H: useLiveSession(id, band, enabled)
-    H->>A: WebSocket open, then {"type":"subscribe","band":"alpha"}
-    loop every 0.5 s
-        A-->>H: frame
-        H->>H: frameRef.current = frame, set elapsed and delay
-        H-->>P: re-render (text only)
+    P->>A: GET /sessions/{id}/events
+    alt session is live
+        P->>H: useLiveSession(id, band, links, rawChannels, enabled)
+        H->>A: WebSocket open, then subscribe {band, links, raw}
+        loop every 0.5 s
+            A-->>H: frame (and links, when subscribed)
+            H->>H: frameRef.current = frame, add to history, count quality
+            H-->>P: re-render (text, chart)
+        end
+    else session has ended
+        P->>A: GET /sessions/{id}/rollups
+        P->>P: playhead picks one rollup, shaped like a frame
     end
     loop every animation frame
-        S->>H: read frameRef.current
+        S->>P: read the frame ref
         S->>S: move each dot's color toward its target
     end
 ```
 
-**`useLiveSession(id, band, enabled)`**
-1. It opens the WebSocket and sends `subscribe` with the band. A second effect resends it whenever the band changes.
+**`useLiveSession(id, band, links, rawChannels, enabled)`**
+1. It opens the WebSocket and sends `subscribe` with the band, whether links are wanted, and the channels wanted as raw signal. It sends it again whenever one of them changes.
 2. Each frame is stored in `frameRef`, a ref, so the 3D scene can read it without React re-rendering. A frame that still carries the previous band is ignored.
-3. Elapsed time (`windowIndex × 0.5 s`) and delay (`Date.now() − sentTimeMs`) are state, so the top-left text updates once per frame from the server.
-4. Events are added to the front of a list, capped at 200.
-5. When the socket closes, `status` becomes `reconnecting` and it retries after 1, 2, 4, 8 and then 10 seconds.
+3. Elapsed time (`windowIndex × 0.5 s`) and delay (`Date.now() − sentTimeMs`) are state, so the page re-renders once per frame from the server.
+4. It keeps a history of frames for the chart, and running quality counts per sensor (`QualityStats`): how often each was bad, and for how long it has been bad now.
+5. `links` messages go to `linksRef`, `raw` messages into `rawRef`, a ring buffer per watched sensor. Both are refs, read by the drawing loops.
+6. Events are added to the front of a list.
+7. When the socket closes, `status` becomes `reconnecting` and it retries with backoff.
 
 **`HeadScene`**
-1. `placeSensors()` puts each channel on a slightly stretched sphere, using `positions.json`. A channel with no known position goes in a row under the head.
-2. `Sensors` draws all dots as one `InstancedMesh` and all red rings as a second.
-3. Inside `useFrame`, each dot's color moves part of the way toward its target every animation frame. The target is the band's relative power mapped from dim to bright amber, with 60% or more at full brightness. Before the first frame every dot is grey.
-4. A ring is shown for every channel whose `quality` in the newest frame is not 1. Rings are laid out once per frame from the server, not every animation frame.
-5. `OrbitControls` allows rotation and limited zoom, no panning. The head turns slowly by itself until the first drag.
-6. `HeadScene` is wrapped in `memo` and gets only stable props, so the page's text updates never re-render it.
+1. It loads the brain model. `placeSensors()` puts each channel on the model's scalp; if the model cannot be loaded, a grey stretched sphere stands in and `positions.json` is used. A channel with no known position goes in a row under the head.
+2. `Brain` draws the brain inside a glass head. `Sensors` draws all dots as one `InstancedMesh` and all red rings as a second.
+3. Inside `useFrame`, each dot's color moves part of the way toward its target every animation frame. The target is the band's relative power on the theme's scale, with 60% or more at full strength. Before the first frame every dot is grey.
+4. A ring is shown for every channel whose `quality` in the newest frame is not OK.
+5. `Links` draws the correlation pairs as arcs over the head, in one `LineSegments` geometry. A line's opacity eases toward its strength. Lines touching a sensor that turns bad go red and stay until it recovers.
+6. `OrbitControls` allows rotation and limited zoom, no panning. The head turns slowly by itself until the first drag.
+7. `HeadScene` is wrapped in `memo` and gets only stable props, so the page's twice-a-second updates never re-render it.
 
-**`SessionPage`**
-- The top-left text shows "Waiting for data" until the first frame and "Reconnecting…" while the socket is down.
-- Clicking a dot opens a popover with the channel name, its current value and its quality. It closes on its ×, or on a press anywhere else.
-- On a screen narrower than 800 px the rail moves below the head.
+**`Timeline`** draws band strength over time. The page chooses the lines: the average of all sensors, one line per brain region, left against right, or the highlighted sensor alone. It also draws the baseline as a dashed line and a tick for each event.
 
-**What this page does not do.** It shows only what arrives over the WebSocket. It does not load stored events or rollups, so a session that has already ended shows the grey head and "Waiting for data", and events that fired before the page opened are not listed. The REST endpoints for history still exist in the api.
+**`useBaseline`** reads the first three stored rollups (30 seconds) and averages them per sensor and band, leaving out rollups where the sensor was bad. The chart title and the popover compare against it ("+17% vs baseline").
+
+**`RawTraces`** draws the watched sensors' raw signal on a canvas every animation frame: eight standard sensors, or the highlighted one alone, which then also gets its frequency spectrum.
+
+**`SensorMap`** draws every sensor at once, flattened as seen from above, in the same color scale.
+
+**Theme.** Every color is a CSS variable in `globals.css`, once per theme; `<html data-theme>` picks the set. A script in `layout.tsx` sets it before the first paint from the saved choice, or the system setting. The canvas and the 3D scene cannot use CSS variables, so they read them through `usePalette()`. The switch is on the home page only.
+
+**Other behaviour**
+- The top-left text shows "Waiting for data" until the first frame, "Reconnecting…" while the socket is down, and "Ended" with the playhead's time range for an ended session.
+- Clicking a dot opens a popover: channel name, current value, comparison with the baseline, quality, and how much of the time it was bad.
+- Clicking an event highlights its sensor and marks its tick on the chart.
+- After 5 seconds without a frame, the page asks the api whether the session has ended, and switches to history when it has.
+- On a narrow screen the rail moves below the head.
 
 ## 7. Life of one batch, end to end
 
