@@ -40,8 +40,9 @@ type sample struct {
 	flatten     string // CHANNEL@SECONDS, or empty
 }
 
-// The three demo samples, all from subject 1's baseline runs of the PhysioNet
-// EEG Motor Movement/Imagery dataset (ODC-By 1.0).
+// The demo samples, all from subject 1 of the PhysioNet EEG Motor
+// Movement/Imagery dataset (ODC-By 1.0): the two baseline runs, and one task
+// run whose file carries markers.
 var samples = []sample{
 	{Name: "eyes-open", Title: "Eyes open", file: "S001R01.edf",
 		Description: "One minute at rest with eyes open. Back-of-head alpha stays low."},
@@ -49,6 +50,8 @@ var samples = []sample{
 		Description: "One minute at rest with eyes closed. Back-of-head alpha is about 3.7 times stronger."},
 	{Name: "eyes-closed-flat-cz", Title: "Eyes closed, Cz fails", file: "S001R02.edf", flatten: "Cz@20",
 		Description: "The same run with sensor Cz going flat at 20 s, to show bad-sensor detection."},
+	{Name: "fists", Title: "Left and right fist", file: "S001R03.edf",
+		Description: "Two minutes of a task, with the experiment's markers: T1 is a left fist, T2 a right fist, T0 rest."},
 }
 
 // objectStore connects to the S3-compatible store that keeps uploaded files.

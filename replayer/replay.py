@@ -82,6 +82,11 @@ class Replay:
             self.num_batches = min(self.num_batches, math.ceil(end_seconds / BATCH_SECONDS))
         self.first_seq = max(0, int((start_seconds - WARMUP_SECONDS) / BATCH_SECONDS)) if start_seconds > 0 else 0
         self.next_seq = self.first_seq  # survives reconnects
+        # The recording's markers, grouped by the batch that holds their sample.
+        self.markers: dict[int, list[ingest_pb2.Marker]] = {}
+        for m in rec.markers:
+            self.markers.setdefault(m.sample_index // self.batch_samples, []).append(ingest_pb2.Marker(
+                sample_index=m.sample_index, label=m.label, duration_seconds=m.duration_seconds))
 
     @property
     def done(self) -> bool:
@@ -90,7 +95,7 @@ class Replay:
 
     def requests(self):
         """Yield the messages for one stream: the header, then every batch from
-        next_seq on, each scheduled against a monotonic clock so timing does
+        next_seq on (with the markers that fall inside it), each scheduled against a monotonic clock so timing does
         not drift. At infinite speed batches go out as fast as gRPC takes them.
         Stops early (ending the stream cleanly) when the stop event is set."""
         yield ingest_pb2.IngestRequest(
@@ -120,6 +125,7 @@ class Replay:
                     sent_time_unix_nanos=time.time_ns(),
                     num_samples=len(rows),
                     values=rows.ravel(),
+                    markers=self.markers.get(seq),
                 )
             )
             self.next_seq = seq + 1

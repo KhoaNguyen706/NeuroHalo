@@ -47,7 +47,7 @@ var (
 		Help: "Client streams open right now.",
 	})
 	// rejectedBatches counts batches refused, by reason: session_id,
-	// num_samples, values (wrong count) or not_batch. Raised by: validateBatch, server.Stream.
+	// num_samples, values (wrong count), marker or not_batch. Raised by: validateBatch, server.Stream.
 	rejectedBatches = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "rejected_batches_total",
 		Help: "Batches refused by validation, by reason.",
@@ -60,6 +60,9 @@ const (
 	logEvery       = 5 * time.Second
 	publishTimeout = 5 * time.Second
 	dbTimeout      = 5 * time.Second
+
+	maxMarkersPerBatch  = 32 // far more than an experiment sends in 100 ms
+	maxMarkerLabelBytes = 64
 )
 
 // server implements the Ingest gRPC service and holds what its handlers need.
@@ -103,7 +106,8 @@ func validateHeader(h *neurov1.SessionHeader) error {
 }
 
 // validateBatch checks one batch against its session's header: same session
-// ID, at most 100 ms of samples, and exactly num_samples x channels values.
+// ID, at most 100 ms of samples, exactly num_samples x channels values, and
+// well-formed markers (validateMarkers).
 // It returns an INVALID_ARGUMENT error otherwise.
 func validateBatch(h *neurov1.SessionHeader, b *neurov1.SampleBatch) error {
 	maxSamples := uint32(math.Ceil(h.SampleRateHz * batchSeconds))
@@ -118,6 +122,34 @@ func validateBatch(h *neurov1.SessionHeader, b *neurov1.SampleBatch) error {
 	case len(b.Values) != want:
 		rejectedBatches.WithLabelValues("values").Inc()
 		return status.Errorf(codes.InvalidArgument, "batch %d: %d values, want %d (num_samples x channels)", b.Seq, len(b.Values), want)
+	}
+	if err := validateMarkers(b); err != nil {
+		rejectedBatches.WithLabelValues("marker").Inc()
+		return err
+	}
+	return nil
+}
+
+// validateMarkers checks the markers a batch carries: at most
+// maxMarkersPerBatch of them, each with a label of 1 to maxMarkerLabelBytes
+// bytes, a duration of 0 or more, and a sample index that lies inside the batch.
+// It returns an INVALID_ARGUMENT error otherwise.
+// Used by: validateBatch.
+func validateMarkers(b *neurov1.SampleBatch) error {
+	if len(b.Markers) > maxMarkersPerBatch {
+		return status.Errorf(codes.InvalidArgument, "batch %d: %d markers, at most %d allowed", b.Seq, len(b.Markers), maxMarkersPerBatch)
+	}
+	end := b.FirstSampleIndex + uint64(b.NumSamples)
+	for _, m := range b.Markers {
+		switch {
+		case m.Label == "" || len(m.Label) > maxMarkerLabelBytes:
+			return status.Errorf(codes.InvalidArgument, "batch %d: marker label must be 1 to %d bytes", b.Seq, maxMarkerLabelBytes)
+		case m.SampleIndex < b.FirstSampleIndex || m.SampleIndex >= end:
+			return status.Errorf(codes.InvalidArgument, "batch %d: marker %q at sample %d is outside the batch (%d..%d)",
+				b.Seq, m.Label, m.SampleIndex, b.FirstSampleIndex, end-1)
+		case !(m.DurationSeconds >= 0) || math.IsInf(m.DurationSeconds, 0):
+			return status.Errorf(codes.InvalidArgument, "batch %d: marker %q has a bad duration", b.Seq, m.Label)
+		}
 	}
 	return nil
 }

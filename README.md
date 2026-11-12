@@ -14,6 +14,7 @@ It is a streaming pipeline first: gRPC in, Kafka in the middle, WebSocket out. R
 - **Watch it live:** band strength (delta, theta, alpha, beta, gamma) per sensor on a 3D head, a chart against the session's own baseline, the raw signal, and a flat map of every sensor.
 - **Catch bad sensors:** a sensor that goes flat or noisy gets a red ring and an event, and another event when it recovers.
 - **Flag eye movements and muscle activity:** the two most common kinds of non-brain signal are listed as they start. The rules are simple thresholds, not checked against hand-labelled data.
+- **See the experiment's markers:** when the recording or the live stream says "a cue was shown here", that moment is placed on the exact sample it belongs to, shown on the chart and kept in the event history.
 - **Go back:** an ended session is stored as 10-second averages and events. Move a playhead through it, export CSV, or replay any stretch as a new live session.
 
 ## How it is built
@@ -66,7 +67,7 @@ The processors share the Kafka topic as one consumer group. Kill one, and Kafka 
 
 ## Live input
 
-`replayer/lsl_bridge.py` forwards a Lab Streaming Layer stream, the way EEG amplifiers publish data on a network, into the pipeline as a live session. It has been tested with the included simulator (`lsl_sim.py`), not with a real amplifier.
+`replayer/lsl_bridge.py` forwards a Lab Streaming Layer stream, the way EEG amplifiers publish data on a network, into the pipeline as a live session. A marker stream on the same network, the way experiment software announces each cue, is forwarded with it. Both have been tested with the included simulator (`lsl_sim.py`), not with a real amplifier.
 
 ```powershell
 cd replayer

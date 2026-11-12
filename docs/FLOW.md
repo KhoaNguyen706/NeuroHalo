@@ -55,10 +55,10 @@ A session can start three ways, and all three feed the same pipeline: a built-in
 | From → to | Message | Size per session | Rate per session |
 | --- | --- | --- | --- |
 | replayer → gateway | `SessionHeader`, once per connection | names of 64 sensors | once |
-| replayer → gateway | `SampleBatch`: 16 samples × 64 sensors | 1,024 floats ≈ 4 KB | 10 a second |
+| replayer → gateway | `SampleBatch`: 16 samples × 64 sensors, plus any markers that fall on those samples | 1,024 floats ≈ 4 KB | 10 a second |
 | gateway → `eeg.raw` | the same `SampleBatch`, unchanged | ≈ 4 KB | 10 a second |
 | processor → `eeg.features` | `FeatureFrame`: 64 sensors × 5 bands + 64 quality flags | 320 floats | 2 a second |
-| processor → `eeg.events` | `Event` (`channel_bad`, `channel_recovered`, `alpha_rise`) | small | only when something happens |
+| processor → `eeg.events` | `Event` (`channel_bad`, `channel_recovered`, `alpha_rise`, `eye_movement`, `muscle`, `marker`) | small | only when something happens |
 | api → Postgres | one `rollups` row per 10 seconds, event rows as they come | | 0.1 rows a second plus events |
 | api → browser | one band of a frame: 64 values + 64 quality flags, as JSON | about 1 KB | 2 a second per viewer |
 
@@ -132,7 +132,8 @@ sequenceDiagram
 1. `load_edf(path)` reads the file with MNE (`read_raw_edf`).
 2. Each channel name goes through `normalize_channel_name`, which strips the dots the dataset adds and fixes the casing against MNE's standard layout (`"Fc5."` → `"FC5"`).
 3. Values are converted from volts to **microvolts** as `float32` and transposed to one row per sample, giving shape `(samples, 64)`.
-4. It returns a `Recording`.
+4. `read_markers` turns the file's annotations into markers: sample index, label, duration.
+5. It returns a `Recording`.
 
 **`replay.py`**
 1. `main()` parses the flags (`--file`, `--gateway`, `--session-id`, `--speed`, `--flatten`, `--token`).
@@ -140,7 +141,7 @@ sequenceDiagram
 3. `Replay(rec, session_id, speed)` works out `batch_samples = 16` (100 ms at 160 Hz) and `num_batches`.
 4. `Replay.requests()` is a **generator** that gRPC pulls messages from:
    - It yields the `SessionHeader` first.
-   - It yields one `SampleBatch` per 100 ms, from `next_seq` on. Each send time is scheduled against `time.monotonic()` (`due = t0 + n × 0.1 / speed`), so timing never drifts.
+   - It yields one `SampleBatch` per 100 ms, from `next_seq` on, carrying the markers whose sample is in it. Each send time is scheduled against `time.monotonic()` (`due = t0 + n × 0.1 / speed`), so timing never drifts.
    - It updates `next_seq` after each batch is taken.
 5. The reconnect loop in `main()` works like this:
    - **Retryable errors** (`UNAVAILABLE`, `DEADLINE_EXCEEDED`, `ABORTED`): it moves `next_seq` back by `REWIND_BATCHES = 10`, because batches that were in flight may be lost. It waits with backoff (0.5 s doubling to 10 s), then opens a new stream. That stream resends the header with the same `session_id` and continues `seq`.
@@ -171,7 +172,7 @@ flowchart TD
    - `authorized()` looks for `authorization: Bearer <token>` in the gRPC metadata. It compares in constant time.
    - The first message must be a header. `validateHeader()` checks it has a session ID, a positive sample rate and at least one channel.
    - `saveSession()` runs `INSERT … ON CONFLICT DO UPDATE SET status='live'`. A reconnect with the same ID therefore just sets the session live again; `started_at` never changes.
-   - For each batch, `validateBatch()` checks three things: the same session ID, 1 to 16 samples, and exactly `num_samples × channels` values.
+   - For each batch, `validateBatch()` checks the same session ID, 1 to 16 samples, exactly `num_samples × channels` values, and its markers (`validateMarkers()`): at most 32, each with a label of 1 to 64 bytes and a sample index inside the batch.
    - `publish()` serialises the batch and calls `ProduceSync`, which **waits** until Kafka confirms. So a batch the gateway counted is a batch Kafka has. It also means one session's batches go out one at a time, in order.
    - When the client closes the stream (`io.EOF`), `endSession()` sets `status='ended'` and the gateway replies with an `IngestSummary`.
 
@@ -208,8 +209,9 @@ flowchart TD
 `session.add(batch)` does the following:
 1. **Duplicate:** if `seq ≤ lastSeq`, it drops the batch and reports `duplicate`.
 2. **Gap:** if `seq > lastSeq + 1`, it clears the buffer and reports `gap`. The next window starts 2 seconds later.
-3. It copies each of the 16 rows into the ring.
-4. After each row, it checks whether the buffer is full and `sampleCount % 80 == 0`, that is, every 0.5 s on the **recording's** sample positions. If so, it runs:
+3. `markerEvents(batch)` turns the batch's markers into `marker` events (see "Markers" below).
+4. It copies each of the 16 rows into the ring.
+5. After each row, it checks whether the buffer is full and `sampleCount % 80 == 0`, that is, every 0.5 s on the **recording's** sample positions. If so, it runs:
    - `compute(windowIndex)` to get a `FeatureFrame`;
    - `detect(frame)` to get events.
 
@@ -242,8 +244,9 @@ flowchart TD
 | `channel_recovered` | A bad sensor is OK for 3 windows in a row |
 | `alpha_rise` | Mean back-of-head alpha is above 1.5 × the session's running average for 4 windows. It needs 10 windows of history first, and fires once per rise |
 | `eye_movement`, `muscle` | See "Eye movements and muscle activity" below |
+| `marker` | One per marker the batch carries. See "Markers" below |
 
-The event time is `windowTime(windowIndex)`, which is recording time (see "Two clocks").
+The event time is `windowTime(windowIndex)`, which is recording time (see "Two clocks"). A marker's time is `sampleTime(sampleIndex)`, on the same clock.
 
 ## 4. Api (`api/`)
 
@@ -327,7 +330,7 @@ sequenceDiagram
 
 | Request | Handler | What it does |
 | --- | --- | --- |
-| `GET /samples` | `listSamples` | The three built-in samples |
+| `GET /samples` | `listSamples` | The four built-in samples |
 | `POST /samples/{name}/play?speed=1x\|fast` | `playSample` | Queues a replay of a sample; returns the new session ID |
 | `POST /uploads` (multipart `file`, `speed`) | `upload` | Checks, stores and queues an uploaded EDF; returns the session ID and what the header says |
 | `GET /replays/{id}` | `getReplay` | The job's state: queued, running, done or failed with a message |
@@ -431,7 +434,7 @@ sequenceDiagram
 6. `OrbitControls` allows rotation and limited zoom, no panning. The head turns slowly by itself until the first drag.
 7. `HeadScene` is wrapped in `memo` and gets only stable props, so the page's twice-a-second updates never re-render it.
 
-**`Timeline`** draws band strength over time. The page chooses the lines: the average of all sensors, one line per brain region, left against right, or the highlighted sensor alone. It also draws the baseline as a dashed line and a tick for each event.
+**`Timeline`** draws band strength over time. The page chooses the lines: the average of all sensors, one line per brain region, left against right, or the highlighted sensor alone. It also draws the baseline as a dashed line and a tick for each event, markers included.
 
 **`useBaseline`** reads the first three stored rollups (30 seconds) and averages them per sensor and band, leaving out rollups where the sensor was bad. The chart title and the popover compare against it ("+17% vs baseline").
 
@@ -603,6 +606,30 @@ uv run --group lsl lsl_bridge.py         # terminal 2: the session appears on th
 ```
 
 Tested with the simulator only. No real amplifier has been connected.
+
+# Markers
+
+A marker says that something happened in the experiment at one exact sample: a picture was shown, a task began. Researchers cut the signal around markers, so a marker's position has to be exact.
+
+A marker is a `Marker{sample_index, label, duration_seconds}` inside the `SampleBatch` that holds its sample. It has no topic of its own. Riding with the samples gives three things for free:
+- it can never arrive before or after its samples, on any path;
+- a batch sent twice after a reconnect is dropped by `seq`, markers and all;
+- the processor that owns the session's samples also owns its markers.
+
+| Step | What happens | Where |
+| --- | --- | --- |
+| From a file | Each annotation in the EDF file becomes a marker at `round(onset × rate)` | `edf.read_markers` |
+| From a live stream | The bridge reads the first LSL stream of type `Markers` next to the EEG stream. Both carry times on one clock, so a marker's sample is found by counting back from the newest EEG sample. A marker whose sample was already sent goes on the next batch's first sample (at most 0.1 s late) and is counted | `Bridge.pull_markers`, `Bridge.take_markers` |
+| Gateway | Refuses a batch whose marker is outside the batch, has no label or a label over 64 bytes, or that carries more than 32 | `validateMarkers` |
+| Processor | Emits one `marker` event per marker, timed at the marker's own sample, with `{"label", "sample", "duration"}` as details. Markers on the same sample become one event with the labels joined by ` + `, because `events` keeps one row per session, type and time | `session.markerEvents` |
+| Api | Nothing special: a marker is stored and pushed to viewers like any other event | `store.handleEvent`, `hub.publishEvent` |
+| Web | The event list shows the label; the chart gets a thin grey tick; the events CSV has the label and the sample index | `eventText`, `MARK_KIND` |
+
+The sample "Left and right fist" (`S001R03.edf`) carries 30 markers: `T0` rest, `T1` left fist, `T2` right fist. `lsl_sim.py` publishes a file's markers as a second LSL stream.
+
+Measured on 2026-11-12: the sample replayed through the pipeline stored 30 of 30 markers at the file's own times (0, 4.2, 8.3, 12.5 s, …). Through the LSL simulator and bridge, 9 of 9 markers kept the file's spacing to the sample (672 and 656 samples apart) and none was late. Only one marker stream is read, and no real experiment software has been connected.
+
+Not built yet: nothing is computed around a marker. The next step is the averaged response per label, updated as trials come in.
 
 # Eye movements and muscle activity
 

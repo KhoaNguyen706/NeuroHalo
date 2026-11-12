@@ -19,8 +19,9 @@ export type Point = { t: number; v: number };
 export type Series = { key: string; label: string; points: Point[]; shade: string };
 
 // One event on the time axis. kind picks the tick's color: "bad" red,
-// "rise" amber, "recovered" grey. Built by: the session page. Used by: Timeline.
-export type Mark = { key: string; t: number; kind: "bad" | "recovered" | "rise" };
+// "rise" amber, "recovered" grey, "marker" (from the experiment) dark grey.
+// Built by: the session page. Used by: Timeline.
+export type Mark = { key: string; t: number; kind: "bad" | "recovered" | "rise" | "marker" };
 
 const LABEL_GAP = 13; // least distance between two line labels, in pixels
 const HEIGHT = 150;

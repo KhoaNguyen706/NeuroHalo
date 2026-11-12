@@ -8,6 +8,10 @@ local network. This bridge finds such a stream and sends it on in 100 ms
 batches, the same messages the replayer sends for a file. The session shows
 up on the home page while it is live, and ends when the stream goes quiet.
 
+If the network also has a marker stream (LSL type "Markers", which experiment
+software such as PsychoPy publishes when it shows a cue), its markers are sent
+along, each inside the batch that holds the sample it belongs to.
+
 With no amplifier at hand, lsl_sim.py publishes a recording as an LSL stream.
 """
 
@@ -22,7 +26,7 @@ import grpc
 import numpy as np
 import pylsl
 
-from edf import _standard_names, normalize_channel_name
+from edf import _standard_names, clip_label, normalize_channel_name
 from neuro.v1 import ingest_pb2, ingest_pb2_grpc
 from replay import BATCH_SECONDS, RETRYABLE, REWIND_BATCHES, ReplayError
 
@@ -51,14 +55,22 @@ def channel_layout(info: "pylsl.StreamInfo") -> tuple[list[str], float]:
     return names, TO_MICROVOLTS.get(unit.strip().lower(), 1.0)
 
 
-# One live stream being forwarded: the inlet plus how far it has been sent.
+# One live stream being forwarded: the inlet plus how far it has been sent,
+# and the markers waiting to be sent with their samples.
 # Created by: main.
 # Used by: main, which calls requests() once per gateway connection.
 class Bridge:
-    def __init__(self, inlet: "pylsl.StreamInlet", session_id: str, idle_seconds: float, stop: threading.Event):
-        """Read the stream's rate and channels, and work out the batch size."""
+    def __init__(self, inlet: "pylsl.StreamInlet", session_id: str, idle_seconds: float, stop: threading.Event,
+                 marker_inlet: "pylsl.StreamInlet | None" = None):
+        """Read the stream's rate and channels, and work out the batch size.
+        marker_inlet is the experiment's marker stream, when there is one."""
         info = inlet.info()
         self.inlet = inlet
+        self.marker_inlet = marker_inlet
+        self.pulled = 0  # samples taken from the EEG stream so far
+        self.newest_stamp = 0.0  # LSL time of the newest of them
+        self.waiting: list[tuple[float, str]] = []  # markers (LSL time, label) not yet in a batch
+        self.late_markers = 0  # markers that arrived after their sample was sent
         self.session_id = session_id
         self.idle_seconds = idle_seconds
         self.stop = stop
@@ -81,27 +93,64 @@ class Bridge:
         yield from list(self.recent)
         last_sample = time.monotonic()
         while not self.stop.is_set():
-            chunk, _ = self.inlet.pull_chunk(timeout=0.2, max_samples=self.batch_samples * 10)
+            chunk, stamps = self.inlet.pull_chunk(timeout=0.2, max_samples=self.batch_samples * 10)
+            self.pull_markers()
             if chunk:
                 last_sample = time.monotonic()
+                self.pulled += len(chunk)
+                self.newest_stamp = stamps[-1]
                 rows = np.asarray(chunk, dtype=np.float32) * self.scale
                 self.pending = np.concatenate([self.pending, rows])
             elif time.monotonic() - last_sample > self.idle_seconds:
                 break
             while len(self.pending) >= self.batch_samples:
                 rows, self.pending = self.pending[: self.batch_samples], self.pending[self.batch_samples:]
+                first = self.next_seq * self.batch_samples
                 request = ingest_pb2.IngestRequest(batch=ingest_pb2.SampleBatch(
                     session_id=self.session_id,
                     seq=self.next_seq,
-                    first_sample_index=self.next_seq * self.batch_samples,
+                    first_sample_index=first,
                     sent_time_unix_nanos=time.time_ns(),
                     num_samples=len(rows),
                     values=rows.ravel(),
+                    markers=self.take_markers(first, first + len(rows)),
                 ))
                 self.recent.append(request)
                 self.next_seq += 1
                 yield request
         self.ended = True
+
+    def pull_markers(self) -> None:
+        """Move every marker that has arrived on the marker stream into the
+        waiting list. Does nothing when there is no marker stream."""
+        if self.marker_inlet is None:
+            return
+        samples, stamps = self.marker_inlet.pull_chunk(timeout=0.0)
+        for sample, stamp in zip(samples, stamps):
+            label = clip_label(str(sample[0]))
+            if label:
+                self.waiting.append((stamp, label))
+
+    def take_markers(self, first: int, end: int) -> list[ingest_pb2.Marker]:
+        """Return the waiting markers that belong in the batch holding samples
+        first to end-1, and remove them from the waiting list.
+
+        A marker's sample is found by counting back from the newest EEG sample:
+        both streams carry LSL times on the same clock. A marker whose sample
+        was already sent goes on this batch's first sample and is counted as
+        late; one whose sample has not arrived yet keeps waiting."""
+        markers, still_waiting = [], []
+        for stamp, label in self.waiting:
+            index = self.pulled - 1 - round((self.newest_stamp - stamp) * self.rate)
+            if index >= end:
+                still_waiting.append((stamp, label))
+                continue
+            if index < first:
+                self.late_markers += 1
+                index = first
+            markers.append(ingest_pb2.Marker(sample_index=index, label=label))
+        self.waiting = still_waiting
+        return markers
 
 
 def main() -> None:
@@ -109,6 +158,8 @@ def main() -> None:
     to the gateway with backoff when the connection breaks."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--name", default=None, help="LSL stream name; default: the first stream of type EEG")
+    p.add_argument("--markers", default=None, metavar="NAME",
+                   help='marker stream name; default: the first stream of type Markers, if any; "none" sends no markers')
     p.add_argument("--gateway", default="localhost:50051", help="gateway address")
     p.add_argument("--session-id", default=None, help="defaults to a random ID")
     p.add_argument("--wait", type=float, default=10.0, help="seconds to look for the stream")
@@ -120,9 +171,20 @@ def main() -> None:
     found = pylsl.resolve_byprop(prop, value, timeout=args.wait)
     if not found:
         raise SystemExit(f"no LSL stream with {prop} {value!r} found within {args.wait:g} s")
-    inlet = pylsl.StreamInlet(found[0], max_buflen=60)
+    # proc_ALL puts both streams' times on this machine's clock and smooths
+    # them, so a marker's time can be compared with the samples' times.
+    inlet = pylsl.StreamInlet(found[0], max_buflen=60, processing_flags=pylsl.proc_ALL)
+    marker_inlet = None
+    if args.markers != "none":
+        prop_m, value_m = ("name", args.markers) if args.markers else ("type", "Markers")
+        found_m = pylsl.resolve_byprop(prop_m, value_m, timeout=args.wait if args.markers else 2.0)
+        if found_m:
+            marker_inlet = pylsl.StreamInlet(found_m[0], max_buflen=60, processing_flags=pylsl.proc_ALL)
+            print(f"markers from LSL stream {found_m[0].name()!r}")
+        elif args.markers:
+            raise SystemExit(f"no LSL marker stream named {args.markers!r} found within {args.wait:g} s")
     stop = threading.Event()
-    bridge = Bridge(inlet, args.session_id or f"s-{uuid.uuid4().hex[:12]}", args.idle, stop)
+    bridge = Bridge(inlet, args.session_id or f"s-{uuid.uuid4().hex[:12]}", args.idle, stop, marker_inlet)
     if bridge.rate <= 0:
         raise SystemExit("the stream has no fixed sample rate; only regularly sampled streams can be forwarded")
     print(f"session {bridge.session_id}: LSL stream {found[0].name()!r}, {len(bridge.names)} channels at "
@@ -137,6 +199,9 @@ def main() -> None:
                     summary = ingest_pb2_grpc.IngestStub(channel).Stream(bridge.requests(), metadata=metadata)
                 print(f"session {bridge.session_id}: stream ended, {bridge.next_seq} batches sent, "
                       f"gateway's last seq {summary.last_seq}")
+                if bridge.late_markers:
+                    print(f"{bridge.late_markers} markers arrived after their sample was sent; "
+                          f"each was placed on the next batch's first sample")
                 backoff = 0.5
             except grpc.RpcError as err:
                 if err.code() not in RETRYABLE:

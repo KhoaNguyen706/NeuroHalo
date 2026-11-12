@@ -134,6 +134,7 @@ func (s *session) add(b *neurov1.SampleBatch) batchResult {
 		s.pos, s.filled = 0, 0
 	}
 	s.haveSeq, s.lastSeq = true, b.Seq
+	res.events = s.markerEvents(b)
 
 	for row := 0; row < int(b.NumSamples); row++ {
 		copy(s.ring[s.pos*s.channels:], b.Values[row*s.channels:(row+1)*s.channels])
@@ -186,8 +187,51 @@ func (s *session) compute(windowIndex uint64, sentTime int64) *neurov1.FeatureFr
 // reconnects or which processor computed it, so a repeated event is exactly
 // equal and Postgres keeps only one copy.
 func (s *session) windowTime(windowIndex uint64) time.Time {
-	seconds := float64(windowIndex*uint64(s.hop)) / s.rate
+	return s.sampleTime(windowIndex * uint64(s.hop))
+}
+
+// sampleTime is the moment of one sample on the recording's own clock: the
+// session start plus the samples before it.
+// Used by: windowTime, markerEvents.
+func (s *session) sampleTime(sampleIndex uint64) time.Time {
+	seconds := float64(sampleIndex) / s.rate
 	return s.startedAt.Add(time.Duration(seconds * float64(time.Second)))
+}
+
+// markerEvents turns the markers a batch carries into "marker" events, timed
+// at the marker's own sample. Markers on the same sample become one event with
+// their labels joined by " + ", because Postgres keeps one event per session,
+// type and time. A batch read twice gives exactly the same events.
+// Used by: add.
+func (s *session) markerEvents(b *neurov1.SampleBatch) []*neurov1.Event {
+	type merged struct {
+		sample   uint64
+		label    string
+		duration float64
+	}
+	var list []merged
+next:
+	for _, m := range b.Markers {
+		for i := range list {
+			if list[i].sample == m.SampleIndex {
+				list[i].label += " + " + m.Label
+				list[i].duration = max(list[i].duration, m.DurationSeconds)
+				continue next
+			}
+		}
+		list = append(list, merged{m.SampleIndex, m.Label, m.DurationSeconds})
+	}
+	var events []*neurov1.Event
+	for _, m := range list {
+		body, _ := json.Marshal(map[string]any{"label": m.label, "sample": m.sample, "duration": m.duration})
+		events = append(events, &neurov1.Event{
+			SessionId:     s.id,
+			Type:          "marker",
+			TimeUnixNanos: s.sampleTime(m.sample).UnixNano(),
+			DetailsJson:   string(body),
+		})
+	}
+	return events
 }
 
 // detect turns one frame into events: a sensor going bad or recovering, a bad

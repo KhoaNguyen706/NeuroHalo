@@ -4,6 +4,9 @@
     uv run --group lsl lsl_sim.py --file ../data/S001R02.edf --seconds 60
 
 Then, in another terminal:  uv run --group lsl lsl_bridge.py
+
+The file's markers are published too, as a second stream of type "Markers",
+the way experiment software announces each cue it shows.
 """
 
 import argparse
@@ -18,7 +21,8 @@ CHUNK_SECONDS = 0.05  # amplifiers send small chunks; 50 ms is typical
 
 
 def main() -> None:
-    """Load the file, announce the stream, and push samples at real speed
+    """Load the file, announce the EEG stream and the marker stream, and push
+    samples (and each marker when its sample goes out) at real speed
     until --seconds have passed or Ctrl+C. The recording starts over when it
     runs out."""
     here = Path(__file__).resolve().parent
@@ -37,6 +41,9 @@ def main() -> None:
         channel.append_child_value("unit", "microvolts")
         channel.append_child_value("type", "EEG")
     outlet = pylsl.StreamOutlet(info)
+    # A marker stream has one text value per marker and no fixed rate.
+    marker_outlet = pylsl.StreamOutlet(
+        pylsl.StreamInfo(args.name + "-markers", "Markers", 1, pylsl.IRREGULAR_RATE, "string", "neurohalo-sim-markers"))
     print(f"LSL stream {args.name!r}: {len(rec.channel_names)} channels at {rec.sample_rate_hz:g} Hz, from {args.file}")
 
     chunk = round(rec.sample_rate_hz * CHUNK_SECONDS)
@@ -49,6 +56,13 @@ def main() -> None:
                 time.sleep(delay)
             start = (n * chunk) % (len(rec.samples) - chunk)
             outlet.push_chunk(rec.samples[start : start + chunk].tolist())
+            # LSL stamps the chunk's last sample with the time of the push and
+            # counts back from it; give each marker the time of its own sample.
+            pushed = pylsl.local_clock()
+            for m in rec.markers:
+                if start <= m.sample_index < start + chunk:
+                    marker_outlet.push_sample(
+                        [m.label], pushed - (start + chunk - 1 - m.sample_index) / rec.sample_rate_hz)
             n += 1
     except KeyboardInterrupt:
         pass

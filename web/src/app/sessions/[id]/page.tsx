@@ -52,10 +52,12 @@ const EVENT_WORD: Record<string, string> = {
 
 // Events that get a tick on the chart. Eye movements and muscle activity are
 // listed in the rail only: there are several a minute, too many for ticks.
+// A marker is what the experiment itself reported (a cue, a task starting).
 const MARK_KIND: Record<string, Mark["kind"]> = {
   channel_bad: "bad",
   channel_recovered: "recovered",
   alpha_rise: "rise",
+  marker: "marker",
 };
 
 // What the chart draws: one line, one line per brain region, or left and right.
@@ -75,15 +77,22 @@ type Popover = { channel: number; left: number; top: number };
 // Set by: the event list. Used by: SessionPage (chart, highlight).
 type Focus = { key: string; channel: number | null };
 
+// markerLabel is the label the experiment gave a marker event, "" for other events.
+function markerLabel(event: LiveEvent): string {
+  return event.eventType === "marker" && typeof event.details.label === "string" ? event.details.label : "";
+}
+
 // eventText is an event in 1 to 3 words: "Cz bad", "PO8 recovered", "Alpha rise".
+// A marker is shown by its own label, as the experiment wrote it: "T1".
 function eventText(event: LiveEvent): string {
+  if (event.eventType === "marker") return markerLabel(event) || "Marker";
   const word = EVENT_WORD[event.eventType] ?? event.eventType;
   return event.channel ? `${event.channel} ${word}` : word;
 }
 
 // eventKey identifies one event in the list and on the chart.
 function eventKey(event: LiveEvent): string {
-  return `${event.eventType}|${event.channel}|${event.atMs}`;
+  return `${event.eventType}|${event.channel}|${event.atMs}|${markerLabel(event)}`;
 }
 
 // mean of the finite numbers, NaN when there are none.

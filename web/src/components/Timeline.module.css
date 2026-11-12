@@ -75,6 +75,11 @@
   stroke: var(--dim);
 }
 
+.marker {
+  stroke: var(--ink-2);
+  stroke-width: 1;
+}
+
 .range {
   fill: var(--accent-wash);
 }
