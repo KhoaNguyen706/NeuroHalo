@@ -22,7 +22,7 @@ import (
 // starts replays of samples and uploads.
 // Created by: main.
 // Used by: routes, cors, requireToken, listSessions, getSession, listEvents,
-// listRollups, sessionExists (http.go); liveSession (live.go); listSamples,
+// listRollups, sessionExists (http.go); listResponses (responses.go); liveSession (live.go); listSamples,
 // playSample, upload, getReplay, queueReplay (uploads.go).
 type api struct {
 	db        *pgxpool.Pool
@@ -79,6 +79,7 @@ func (a *api) routes() http.Handler {
 	mux.HandleFunc("DELETE /sessions/{id}", a.deleteSession)
 	mux.HandleFunc("GET /sessions/{id}/events", a.listEvents)
 	mux.HandleFunc("GET /sessions/{id}/rollups", a.listRollups)
+	mux.HandleFunc("GET /sessions/{id}/responses", a.listResponses)
 	mux.HandleFunc("GET /ws/sessions/{id}/live", a.liveSession)
 	mux.HandleFunc("GET /samples", a.listSamples)
 	mux.HandleFunc("POST /samples/{name}/play", a.playSample)
@@ -209,7 +210,7 @@ func (a *api) getSession(w http.ResponseWriter, r *http.Request) {
 }
 
 // deleteSession handles DELETE /sessions/{id}: removes an ended session with
-// its events, rollups, summary and replay job, all in one transaction. A
+// its events, rollups, epochs, summary and replay job, all in one transaction. A
 // live session is refused (409): its stream is still writing. When the
 // session came from an upload that no other session uses, the stored file is
 // removed too.
@@ -252,6 +253,7 @@ func (a *api) deleteSession(w http.ResponseWriter, r *http.Request) {
 	for _, q := range []string{
 		`DELETE FROM events WHERE session_id = $1`,
 		`DELETE FROM rollups WHERE session_id = $1`,
+		`DELETE FROM epochs WHERE session_id = $1`,
 		`DELETE FROM summaries WHERE session_id = $1`,
 		`DELETE FROM replays WHERE session_id = $1`,
 		`DELETE FROM sessions WHERE id = $1`,

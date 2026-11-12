@@ -23,9 +23,11 @@ flowchart LR
     RAW --> P[processor<br/>Go]
     P -- "FeatureFrame<br/>every 0.5 s" --> FEAT[[eeg.features]]
     P -- "Event" --> EV[[eeg.events]]
+    P -- "Epoch<br/>per marker" --> EP[[eeg.epochs]]
     FEAT --> API
     EV --> API
-    API -- "events, 10 s rollups" --> PG
+    EP --> API
+    API -- "events, epochs, 10 s rollups" --> PG
     API -- "WebSocket: live frames<br/>REST: history" --> WEB
 ```
 
@@ -59,7 +61,8 @@ A session can start three ways, and all three feed the same pipeline: a built-in
 | gateway → `eeg.raw` | the same `SampleBatch`, unchanged | ≈ 4 KB | 10 a second |
 | processor → `eeg.features` | `FeatureFrame`: 64 sensors × 5 bands + 64 quality flags | 320 floats | 2 a second |
 | processor → `eeg.events` | `Event` (`channel_bad`, `channel_recovered`, `alpha_rise`, `eye_movement`, `muscle`, `marker`) | small | only when something happens |
-| api → Postgres | one `rollups` row per 10 seconds, event rows as they come | | 0.1 rows a second plus events |
+| processor → `eeg.epochs` | `Epoch`: 21 windows × 64 sensors × 5 bands around one marker | 6,720 floats ≈ 27 KB | one per marker, 4 s after it |
+| api → Postgres | one `rollups` row per 10 seconds, event and epoch rows as they come | | 0.1 rows a second plus events |
 | api → browser | one band of a frame: 64 values + 64 quality flags, as JSON | about 1 KB | 2 a second per viewer |
 
 Every Kafka message is **keyed by `session_id`**. Kafka sends all messages with the same key to the same partition, so one session's data always stays in order.
@@ -71,6 +74,7 @@ Every Kafka message is **keyed by `session_id`**. Kafka sends all messages with 
 | `sessions` | gateway (when the header arrives, and when the stream ends) | processor, api |
 | `events` | api store consumer | api REST |
 | `rollups` | api store consumer | api REST |
+| `epochs` | api store consumer | api REST (`/responses`) |
 | `replays` | api (queues a job), replay worker (claims it, records the result) | api REST, the session page while it waits |
 | `summaries` | nobody yet (build step 11) | |
 
@@ -91,7 +95,7 @@ Recording time does not change with replay speed, reconnects or which processor 
 
 Every step is **at least once**: after a crash, some messages can be read or sent again. Duplicates are made harmless at every layer:
 - the processor drops a batch whose `seq` it has already seen;
-- events have a `UNIQUE` constraint plus `ON CONFLICT DO NOTHING`;
+- events have a `UNIQUE` constraint plus `ON CONFLICT DO NOTHING`, and epochs a primary key on session and marker sample;
 - a rollup row is only replaced by one built from at least as many frames.
 
 Consumers commit Kafka offsets only **after** their output is written, so nothing is lost.
@@ -296,6 +300,7 @@ flowchart TD
 | `DELETE /sessions/{id}` | `deleteSession` | removes an ended session with its events, rollups and replay job in one transaction; 409 while it is live |
 | `GET /sessions/{id}/events` | `listEvents` | `ORDER BY at, id` |
 | `GET /sessions/{id}/rollups?from=&to=` | `listRollups` | `from <= bucket_start < to`, both optional (RFC 3339), plus the band names |
+| `GET /sessions/{id}/responses?band=` | `listResponses` | the session's epochs, averaged per marker label for one band (see "Averaged response") |
 
 ### Live view (`api/live.go`)
 
@@ -487,7 +492,7 @@ Tested so far: gateway restart, api restart mid-bucket, wrong token (gRPC, REST 
 # Running it
 
 ```powershell
-docker compose up -d --build                     # the whole stack
+docker compose up -d --build                     # the whole stack (also applies db/schema.sql to an existing database)
 # then open http://localhost:3000, play a sample or upload an .edf file
 ```
 
@@ -629,7 +634,36 @@ The sample "Left and right fist" (`S001R03.edf`) carries 30 markers: `T0` rest, 
 
 Measured on 2026-11-12: the sample replayed through the pipeline stored 30 of 30 markers at the file's own times (0, 4.2, 8.3, 12.5 s, …). Through the LSL simulator and bridge, 9 of 9 markers kept the file's spacing to the sample (672 and 656 samples apart) and none was late. Only one marker stream is read, and no real experiment software has been connected.
 
-Not built yet: nothing is computed around a marker. The next step is the averaged response per label, updated as trials come in.
+# Averaged response
+
+One response to one cue is buried in noise. Researchers repeat the cue many times, cut the signal around each one (an epoch, or trial) and average the epochs of the same label. What survives is the brain's response to that kind of cue. Here the thing averaged is band power: "after a fist cue, alpha over the movement area drops by half for about two seconds".
+
+```mermaid
+flowchart LR
+    M[marker in a batch] --> S[session.startEpochs]
+    S --> T[session.stepEpochs<br/>21 windows, one every 0.25 s]
+    T -- "4 s after the marker" --> EP[[eeg.epochs]]
+    EP --> ST[store.handleEpoch<br/>writeEpochs]
+    ST --> PG[(epochs table)]
+    PG --> R[GET /responses<br/>averageResponses]
+    R -- "every 2 s while live" --> W([ResponseChart])
+```
+
+**Processor (`processor/epochs.go`).** An epoch is 21 windows of 1 second, one every 0.25 s. The first 5 end at 1 s before the marker up to exactly at it, so they hold only signal from before it. The other 16 end 0.25 s to 4 s after it.
+1. `startEpochs()` opens a `pendingEpoch` for each marker of a batch.
+2. `stepEpochs()` runs after every sample row. At the marker's own sample it computes the 5 "before" windows at once, reading back through the 2-second buffer. After that it computes one window every 40 samples. Windows sit at fixed sample positions from the marker, so an epoch computed twice is the same epoch.
+3. `epochStepPower()` calls `Analyzer.Power()` for each sensor. This is the same FFT as the live frames, but the band power is **not** divided by the total: the absolute amount is needed to say "half of what it was". A sensor that is flat or noisy in any window is marked bad for the whole epoch.
+4. After the 21st window `finishEpoch()` builds the `Epoch` message, and `handle()` sends it to `eeg.epochs`, keyed by session ID.
+
+An epoch is dropped when its marker comes before the buffer is full (the first 2 seconds of a stream, or right after a gap), when a batch goes missing before it is complete, or when the processor restarts in the middle of it. Nothing is stored for a dropped epoch; its marker event is still stored.
+
+**Api (`api/responses.go`).** The store consumer reads `eeg.epochs` next to the other two topics. `handleEpoch()` checks the sizes against the session's channels; `writeEpochs()` inserts the poll's epochs in one batch with `ON CONFLICT DO NOTHING`. Each epoch is kept whole, one row per trial, so the average can be recomputed in any band. `listResponses()` reads the session's rows and `averageResponses()` averages them per label; for each sensor it leaves out the trials where that sensor was bad, and reports how many trials went in.
+
+**Web.** The rail shows "Averaged response" once the session has a marker. `useResponses` asks the api every 2 seconds while the session is live. The session page turns the power into a change against the 5 "before" windows, for the highlighted sensor or averaged over all sensors, and `ResponseChart` draws one line per label with its trial count.
+
+Measured on 2026-11-12 with the sample "Left and right fist": 29 of 30 markers gave an epoch (the first marker is at sample 0, with nothing before it). At sensors C3 and C4, over the movement area, alpha fell 50 to 70% about 1 to 1.5 s after the fist cues `T1` and `T2` and rose after the rest cue `T0`, which is the result the literature reports for this task. With 7 or 8 trials per label the left/right difference is not clear.
+
+Limits, for anyone using it as a result: a 1-second window blurs timing to about a second; the bad-sensor rule is the same simple threshold as the live view, so eye blinks reach the frontal sensors' averages; no statistics are computed; and the numbers have not been compared against MNE or EEGLAB on the same file.
 
 # Eye movements and muscle activity
 

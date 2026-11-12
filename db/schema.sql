@@ -1,4 +1,4 @@
--- Postgres holds sessions, events, 10-second rollups and summaries.
+-- Postgres holds sessions, events, 10-second rollups, epochs and summaries.
 -- Raw samples are not stored; the recording files remain the source.
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -29,6 +29,23 @@ CREATE TABLE IF NOT EXISTS rollups (
   bad_channels text[] NOT NULL DEFAULT '{}',    -- not OK in more than half the bucket's frames
   frames       integer NOT NULL DEFAULT 0,      -- frames averaged; a rewrite never replaces a fuller row
   PRIMARY KEY (session_id, bucket_start)
+);
+
+-- The signal around each marker, one row per marker ("trial"): band power in
+-- short windows from before the marker to after it. Averaged per label by
+-- GET /sessions/{id}/responses.
+CREATE TABLE IF NOT EXISTS epochs (
+  session_id     text NOT NULL REFERENCES sessions(id),
+  marker_sample  bigint NOT NULL,               -- the marker's position in the session
+  label          text NOT NULL,
+  at             timestamptz NOT NULL,          -- the marker's time
+  steps          integer NOT NULL,              -- windows in the epoch
+  pre_steps      integer NOT NULL,              -- how many of them end at or before the marker
+  step_seconds   real NOT NULL,                 -- time between two windows
+  window_seconds real NOT NULL,                 -- length of one window
+  band_power     real[] NOT NULL,               -- steps x channels x 5 bands, absolute
+  bad            boolean[] NOT NULL,            -- per channel: flat or noisy somewhere in the epoch
+  PRIMARY KEY (session_id, marker_sample)       -- makes a recomputed epoch harmless
 );
 
 -- Replays the api asked for (samples and uploads). The replay worker claims

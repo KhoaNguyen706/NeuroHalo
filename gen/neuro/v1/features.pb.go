@@ -218,6 +218,127 @@ func (x *Link) GetStrength() float32 {
 	return 0
 }
 
+// The signal around one marker ("one trial"), as band power in short windows
+// that step from before the marker to after it. Averaging the epochs of one
+// label shows how the brain responds to that kind of cue.
+// Step i's window ends (i - (pre_steps - 1)) x step_seconds after the marker,
+// so the first pre_steps windows hold only signal from before it.
+type Epoch struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	Label         string                 `protobuf:"bytes,2,opt,name=label,proto3" json:"label,omitempty"`                                         // the marker's label
+	MarkerSample  uint64                 `protobuf:"varint,3,opt,name=marker_sample,json=markerSample,proto3" json:"marker_sample,omitempty"`      // the marker's position in the session
+	TimeUnixNanos int64                  `protobuf:"varint,4,opt,name=time_unix_nanos,json=timeUnixNanos,proto3" json:"time_unix_nanos,omitempty"` // the marker's time, on the recording's clock
+	Steps         uint32                 `protobuf:"varint,5,opt,name=steps,proto3" json:"steps,omitempty"`
+	PreSteps      uint32                 `protobuf:"varint,6,opt,name=pre_steps,json=preSteps,proto3" json:"pre_steps,omitempty"`
+	StepSeconds   float32                `protobuf:"fixed32,7,opt,name=step_seconds,json=stepSeconds,proto3" json:"step_seconds,omitempty"`
+	WindowSeconds float32                `protobuf:"fixed32,8,opt,name=window_seconds,json=windowSeconds,proto3" json:"window_seconds,omitempty"`
+	BandPower     []float32              `protobuf:"fixed32,9,rep,packed,name=band_power,json=bandPower,proto3" json:"band_power,omitempty"` // steps x channels x 5 bands, absolute (arbitrary unit)
+	Bad           []bool                 `protobuf:"varint,10,rep,packed,name=bad,proto3" json:"bad,omitempty"`                              // per channel: flat or noisy in any of the windows
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Epoch) Reset() {
+	*x = Epoch{}
+	mi := &file_neuro_v1_features_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Epoch) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Epoch) ProtoMessage() {}
+
+func (x *Epoch) ProtoReflect() protoreflect.Message {
+	mi := &file_neuro_v1_features_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Epoch.ProtoReflect.Descriptor instead.
+func (*Epoch) Descriptor() ([]byte, []int) {
+	return file_neuro_v1_features_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *Epoch) GetSessionId() string {
+	if x != nil {
+		return x.SessionId
+	}
+	return ""
+}
+
+func (x *Epoch) GetLabel() string {
+	if x != nil {
+		return x.Label
+	}
+	return ""
+}
+
+func (x *Epoch) GetMarkerSample() uint64 {
+	if x != nil {
+		return x.MarkerSample
+	}
+	return 0
+}
+
+func (x *Epoch) GetTimeUnixNanos() int64 {
+	if x != nil {
+		return x.TimeUnixNanos
+	}
+	return 0
+}
+
+func (x *Epoch) GetSteps() uint32 {
+	if x != nil {
+		return x.Steps
+	}
+	return 0
+}
+
+func (x *Epoch) GetPreSteps() uint32 {
+	if x != nil {
+		return x.PreSteps
+	}
+	return 0
+}
+
+func (x *Epoch) GetStepSeconds() float32 {
+	if x != nil {
+		return x.StepSeconds
+	}
+	return 0
+}
+
+func (x *Epoch) GetWindowSeconds() float32 {
+	if x != nil {
+		return x.WindowSeconds
+	}
+	return 0
+}
+
+func (x *Epoch) GetBandPower() []float32 {
+	if x != nil {
+		return x.BandPower
+	}
+	return nil
+}
+
+func (x *Epoch) GetBad() []bool {
+	if x != nil {
+		return x.Bad
+	}
+	return nil
+}
+
 type Event struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
@@ -231,7 +352,7 @@ type Event struct {
 
 func (x *Event) Reset() {
 	*x = Event{}
-	mi := &file_neuro_v1_features_proto_msgTypes[2]
+	mi := &file_neuro_v1_features_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -243,7 +364,7 @@ func (x *Event) String() string {
 func (*Event) ProtoMessage() {}
 
 func (x *Event) ProtoReflect() protoreflect.Message {
-	mi := &file_neuro_v1_features_proto_msgTypes[2]
+	mi := &file_neuro_v1_features_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -256,7 +377,7 @@ func (x *Event) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Event.ProtoReflect.Descriptor instead.
 func (*Event) Descriptor() ([]byte, []int) {
-	return file_neuro_v1_features_proto_rawDescGZIP(), []int{2}
+	return file_neuro_v1_features_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *Event) GetSessionId() string {
@@ -311,7 +432,21 @@ const file_neuro_v1_features_proto_rawDesc = "" +
 	"\x04Link\x12\f\n" +
 	"\x01a\x18\x01 \x01(\rR\x01a\x12\f\n" +
 	"\x01b\x18\x02 \x01(\rR\x01b\x12\x1a\n" +
-	"\bstrength\x18\x03 \x01(\x02R\bstrength\"\x9f\x01\n" +
+	"\bstrength\x18\x03 \x01(\x02R\bstrength\"\xb7\x02\n" +
+	"\x05Epoch\x12\x1d\n" +
+	"\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x14\n" +
+	"\x05label\x18\x02 \x01(\tR\x05label\x12#\n" +
+	"\rmarker_sample\x18\x03 \x01(\x04R\fmarkerSample\x12&\n" +
+	"\x0ftime_unix_nanos\x18\x04 \x01(\x03R\rtimeUnixNanos\x12\x14\n" +
+	"\x05steps\x18\x05 \x01(\rR\x05steps\x12\x1b\n" +
+	"\tpre_steps\x18\x06 \x01(\rR\bpreSteps\x12!\n" +
+	"\fstep_seconds\x18\a \x01(\x02R\vstepSeconds\x12%\n" +
+	"\x0ewindow_seconds\x18\b \x01(\x02R\rwindowSeconds\x12\x1d\n" +
+	"\n" +
+	"band_power\x18\t \x03(\x02R\tbandPower\x12\x10\n" +
+	"\x03bad\x18\n" +
+	" \x03(\bR\x03bad\"\x9f\x01\n" +
 	"\x05Event\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x12\n" +
@@ -339,12 +474,13 @@ func file_neuro_v1_features_proto_rawDescGZIP() []byte {
 }
 
 var file_neuro_v1_features_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_neuro_v1_features_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_neuro_v1_features_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
 var file_neuro_v1_features_proto_goTypes = []any{
 	(Quality)(0),         // 0: neuro.v1.Quality
 	(*FeatureFrame)(nil), // 1: neuro.v1.FeatureFrame
 	(*Link)(nil),         // 2: neuro.v1.Link
-	(*Event)(nil),        // 3: neuro.v1.Event
+	(*Epoch)(nil),        // 3: neuro.v1.Epoch
+	(*Event)(nil),        // 4: neuro.v1.Event
 }
 var file_neuro_v1_features_proto_depIdxs = []int32{
 	0, // 0: neuro.v1.FeatureFrame.quality:type_name -> neuro.v1.Quality
@@ -367,7 +503,7 @@ func file_neuro_v1_features_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_neuro_v1_features_proto_rawDesc), len(file_neuro_v1_features_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   3,
+			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

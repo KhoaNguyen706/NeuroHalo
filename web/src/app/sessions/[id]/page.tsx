@@ -1,8 +1,9 @@
 "use client";
 
 // The session page: the 3D head with a band strength chart under it, and a
-// rail with the data quality, a band selector, toggles for signal correlation
-// and the flat sensor map, the event list and the CSV exports. While the session is live, frames
+// rail with the data quality, a band selector, toggles for signal correlation,
+// the flat sensor map and (when the session has markers) the averaged
+// response, the event list and the CSV exports. While the session is live, frames
 // stream in over the WebSocket. Once it has ended, the page shows the stored
 // 10-second averages, with a playhead on the chart to move through them.
 
@@ -11,10 +12,12 @@ import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DotPick } from "@/components/HeadScene";
 import RawTraces from "@/components/RawTraces";
+import ResponseChart, { type ResponseLine } from "@/components/ResponseChart";
 import SensorMap from "@/components/SensorMap";
 import Timeline, { type Mark, type Series } from "@/components/Timeline";
 import { BASELINE_SECONDS, useBaseline } from "@/hooks/useBaseline";
 import { useLiveSession, type HistoryFrame } from "@/hooks/useLiveSession";
+import { useResponses } from "@/hooks/useResponses";
 import {
   api, BANDS, QUALITY_NAME, type Band, type LiveEvent, type LiveFrame, type Rollup, type Session,
 } from "@/lib/api";
@@ -136,6 +139,7 @@ function SessionView({ id }: { id: string }) {
   const [links, setLinks] = useState(false); // "Signal correlation" toggle
   const [map, setMap] = useState(false); // "Sensor map" toggle
   const [raw, setRaw] = useState(false); // "Raw signal" toggle
+  const [response, setResponse] = useState(false); // "Averaged response" toggle
   const [chartMode, setChartMode] = useState<ChartMode>("all");
   const [popover, setPopover] = useState<Popover | null>(null);
   const [focus, setFocus] = useState<Focus | null>(null);
@@ -385,6 +389,29 @@ function SessionView({ id }: { id: string }) {
     chartTitle = `${bandName} · by region`;
   }
 
+  // The averaged response is offered once the session has a marker.
+  const hasMarkers = useMemo(() => events.some((e) => e.eventType === "marker"), [events]);
+  const responses = useResponses(id, band, response && hasMarkers, isLive);
+  // One line per marker label: the band's change at each step, compared with
+  // the steps before the marker, for the highlighted sensor or averaged over
+  // all sensors. A sensor that was bad in every trial of a label is left out.
+  const responseLines: ResponseLine[] = useMemo(() => {
+    if (!responses) return [];
+    const channels = highlight != null ? [highlight] : names.map((_, c) => c);
+    return responses.labels.map((l, i) => ({
+      label: l.label,
+      trials: l.trials,
+      shade: SHADES[i % SHADES.length],
+      values: responses.times.map((_, step) => mean(channels.map((c) => {
+        if (!l.good[c]) return NaN;
+        let before = 0;
+        for (let s = 0; s < responses.preSteps; s++) before += l.power[s * names.length + c];
+        before /= responses.preSteps;
+        return before > 0 ? l.power[step * names.length + c] / before - 1 : NaN;
+      }))),
+    }));
+  }, [responses, highlight, names]);
+
   const marks: Mark[] = useMemo(
     () => events
       .filter((e) => MARK_KIND[e.eventType])
@@ -513,6 +540,13 @@ function SessionView({ id }: { id: string }) {
         range={rangeT}
         onPick={ended ? pickTime : undefined}
       />
+      {response && hasMarkers && (
+        <ResponseChart
+          title={`${bandName} · ${highlight != null ? names[highlight] : "average of all sensors"} · change after the marker`}
+          times={responses?.times ?? []}
+          lines={responseLines}
+        />
+      )}
       {raw && isLive && session && (
         <RawTraces rawRef={live.rawRef} frameRef={viewRef} names={names} rate={session.sampleRateHz} />
       )}
@@ -554,6 +588,14 @@ function SessionView({ id }: { id: string }) {
         <button type="button" className={styles.toggle} aria-pressed={map} onClick={() => setMap((on) => !on)}>
           Sensor map
         </button>
+
+        {/* Each line is the average over the trials of one marker label, so it only exists for a session with markers. */}
+        {hasMarkers && (
+          <button type="button" className={styles.toggle} aria-pressed={response}
+            onClick={() => setResponse((on) => !on)}>
+            Averaged response
+          </button>
+        )}
 
         {/* Only a session with a stored recording behind it can be replayed. */}
         {ended && offset != null && (

@@ -15,6 +15,7 @@ It is a streaming pipeline first: gRPC in, Kafka in the middle, WebSocket out. R
 - **Catch bad sensors:** a sensor that goes flat or noisy gets a red ring and an event, and another event when it recovers.
 - **Flag eye movements and muscle activity:** the two most common kinds of non-brain signal are listed as they start. The rules are simple thresholds, not checked against hand-labelled data.
 - **See the experiment's markers:** when the recording or the live stream says "a cue was shown here", that moment is placed on the exact sample it belongs to, shown on the chart and kept in the event history.
+- **See the averaged response build up:** the signal around every marker is cut out and averaged per label while the session runs, so the response to a cue shows after a handful of trials.
 - **Go back:** an ended session is stored as 10-second averages and events. Move a playhead through it, export CSV, or replay any stretch as a new live session.
 
 ## How it is built
@@ -26,6 +27,8 @@ flowchart LR
     RAW --> P[processor<br/>Go]
     P --> FEAT[[eeg.features]]
     P --> EV[[eeg.events]]
+    P --> EP[[eeg.epochs]]
+    EP --> API
     FEAT --> API[api<br/>Go]
     EV --> API
     API -- "events, rollups" --> PG[(Postgres)]
@@ -35,7 +38,7 @@ flowchart LR
 | Piece | What it does |
 | --- | --- |
 | gateway | Checks the token, validates every batch, waits for Kafka's confirmation. Computes nothing |
-| processor | FFT per sensor over a sliding 2-second window: band power, quality flags, events |
+| processor | FFT per sensor over a sliding 2-second window: band power, quality flags, events, and the signal around each marker |
 | api | Two Kafka consumers: one pushes frames to browsers, one writes history to Postgres. The live view never waits on the database |
 | web | Next.js and React Three Fiber |
 

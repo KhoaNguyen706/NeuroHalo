@@ -51,7 +51,7 @@ func main() {
 		kgo.SeedBrokers(strings.Split(env("KAFKA_BROKERS", "localhost:29092"), ",")...),
 		kgo.ClientID("api-store"),
 		kgo.ConsumerGroup(storeGroup),
-		kgo.ConsumeTopics(featuresTopic, eventsTopic),
+		kgo.ConsumeTopics(featuresTopic, eventsTopic, epochsTopic),
 		kgo.DisableAutoCommit(),
 		kgo.BlockRebalanceOnPoll(), // rebalance callbacks never run in the middle of a pass
 		kgo.OnPartitionsRevoked(st.dropPartitions),

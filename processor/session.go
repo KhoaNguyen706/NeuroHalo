@@ -66,6 +66,15 @@ type session struct {
 	eyeActive  bool
 	muscleRun  int
 
+	// Epochs (epochs.go): the window and step sizes in samples, the analyzer
+	// for that window, scratch space for one sensor's window, and the epochs
+	// whose marker has been seen but whose last window is still to come.
+	// epochWin is 0 when the 2-second buffer is too short for them.
+	epochWin, epochStep int
+	epochAnalyzer       *eeg.Analyzer
+	epochScratch        []float32
+	pending             []*pendingEpoch
+
 	lastSeen time.Time
 }
 
@@ -95,6 +104,7 @@ func newSession(id string, sampleRateHz float64, names []string, startedAt time.
 		frontPole:  frontPoleSensors(names),
 		eyeScratch: make([]float64, win),
 	}
+	s.initEpochs()
 	if links != nil {
 		s.linkPairs = links.allowedPairs(names)
 		s.linkWindows = make([]float32, win*n)
@@ -116,11 +126,13 @@ type batchResult struct {
 	gap       bool
 	frames    []*neurov1.FeatureFrame
 	events    []*neurov1.Event
+	epochs    []*neurov1.Epoch
 }
 
-// add feeds one batch in and returns whatever frames and events it completes.
-// A batch at or below the last seq is dropped as a duplicate. A jump in seq
-// clears the buffers and is reported as a gap.
+// add feeds one batch in and returns whatever frames, events and epochs it
+// completes. A batch at or below the last seq is dropped as a duplicate. A
+// jump in seq clears the buffers, drops the unfinished epochs and is reported
+// as a gap.
 func (s *session) add(b *neurov1.SampleBatch) batchResult {
 	var res batchResult
 	s.lastSeen = time.Now()
@@ -132,9 +144,12 @@ func (s *session) add(b *neurov1.SampleBatch) batchResult {
 	if s.haveSeq && b.Seq != s.lastSeq+1 {
 		res.gap = true
 		s.pos, s.filled = 0, 0
+		s.pending = nil
 	}
 	s.haveSeq, s.lastSeq = true, b.Seq
-	res.events = s.markerEvents(b)
+	markers := mergeMarkers(b)
+	res.events = s.markerEvents(markers)
+	s.startEpochs(markers)
 
 	for row := 0; row < int(b.NumSamples); row++ {
 		copy(s.ring[s.pos*s.channels:], b.Values[row*s.channels:(row+1)*s.channels])
@@ -142,6 +157,7 @@ func (s *session) add(b *neurov1.SampleBatch) batchResult {
 		if s.filled < s.win {
 			s.filled++
 		}
+		res.epochs = append(res.epochs, s.stepEpochs(b.FirstSampleIndex+uint64(row))...)
 		// Recompute on fixed sample positions, so a window's index is the same
 		// no matter which processor computes it or when it restarted.
 		sampleCount := b.FirstSampleIndex + uint64(row) + 1
@@ -198,18 +214,21 @@ func (s *session) sampleTime(sampleIndex uint64) time.Time {
 	return s.startedAt.Add(time.Duration(seconds * float64(time.Second)))
 }
 
-// markerEvents turns the markers a batch carries into "marker" events, timed
-// at the marker's own sample. Markers on the same sample become one event with
-// their labels joined by " + ", because Postgres keeps one event per session,
-// type and time. A batch read twice gives exactly the same events.
-// Used by: add.
-func (s *session) markerEvents(b *neurov1.SampleBatch) []*neurov1.Event {
-	type merged struct {
-		sample   uint64
-		label    string
-		duration float64
-	}
-	var list []merged
+// marker is one marker of a batch after merging: markers on the same sample
+// are one marker with their labels joined by " + ".
+// Built by: mergeMarkers. Used by: session.markerEvents, session.startEpochs.
+type marker struct {
+	sample   uint64
+	label    string
+	duration float64
+}
+
+// mergeMarkers returns the batch's markers, one per sample. Postgres keeps one
+// marker event and one epoch per session and sample, so two markers on the
+// same sample have to become one.
+// Used by: session.add.
+func mergeMarkers(b *neurov1.SampleBatch) []marker {
+	var list []marker
 next:
 	for _, m := range b.Markers {
 		for i := range list {
@@ -219,8 +238,15 @@ next:
 				continue next
 			}
 		}
-		list = append(list, merged{m.SampleIndex, m.Label, m.DurationSeconds})
+		list = append(list, marker{m.SampleIndex, m.Label, m.DurationSeconds})
 	}
+	return list
+}
+
+// markerEvents turns a batch's markers into "marker" events, timed at the
+// marker's own sample. A batch read twice gives exactly the same events.
+// Used by: add.
+func (s *session) markerEvents(list []marker) []*neurov1.Event {
 	var events []*neurov1.Event
 	for _, m := range list {
 		body, _ := json.Marshal(map[string]any{"label": m.label, "sample": m.sample, "duration": m.duration})

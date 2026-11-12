@@ -45,6 +45,26 @@ export type SessionEvent = { type: string; channel: string; atMs: number; detail
 // A 10-second rollup. Returned by: api.rollups. Used by: useBaseline.
 export type Rollup = { bucketStart: string; bandPower: number[]; badChannels: string[]; frames: number };
 
+// The averaged response to one marker label, in one band.
+// Part of: Responses. Used by: the session page.
+export type LabelResponse = {
+  label: string;
+  trials: number; // markers with this label that have a finished epoch
+  good: number[]; // per channel: how many of those trials are in its average (bad ones are left out)
+  power: number[]; // steps x channels, row by row: mean band power, in an arbitrary unit
+};
+
+// The averaged responses of a session. Returned by: api.responses.
+// Used by: useResponses, the session page.
+export type Responses = {
+  band: Band;
+  times: number[]; // per step: seconds after the marker (the middle of the step's window)
+  preSteps: number; // the first this-many steps hold only signal from before the marker
+  stepSeconds: number;
+  windowSeconds: number;
+  labels: LabelResponse[];
+};
+
 // The replay job behind a sample or upload. Returned by: api.replay.
 // Used by: the session page while it waits for the session to start.
 export type Replay = {
@@ -133,6 +153,8 @@ export const api = {
     const qs = q.size ? `?${q}` : "";
     return call<{ bands: Band[]; rollups: Rollup[] }>(`/sessions/${enc(id)}/rollups${qs}`);
   },
+  // responses returns the averaged response to each marker label in one band.
+  responses: (id: string, band: Band) => call<Responses>(`/sessions/${enc(id)}/responses?band=${enc(band)}`),
   replay: (id: string) => call<Replay>(`/replays/${enc(id)}`),
   // replayFrom queues a new live replay of a session's recording, from `from`
   // seconds into it up to `to` seconds (to the end when `to` is 0).

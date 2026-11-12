@@ -24,7 +24,7 @@ services:
       timeout: 10s
       retries: 20
 
-  # Creates the three topics, then exits.
+  # Creates the four topics, then exits.
   kafka-init:
     image: apache/kafka:4.0.0
     depends_on:
@@ -38,6 +38,7 @@ services:
         $$T --topic eeg.raw      --partitions 12 --config retention.bytes=1073741824
         $$T --topic eeg.features --partitions 12 --config retention.ms=86400000
         $$T --topic eeg.events   --partitions 3  --config retention.ms=604800000
+        $$T --topic eeg.epochs   --partitions 3  --config retention.ms=604800000
 
   postgres:
     image: postgres:17
@@ -56,6 +57,21 @@ services:
       timeout: 3s
       retries: 20
 
+  # Applies db/schema.sql, then exits. Postgres itself only runs the file on a
+  # brand-new data volume; this runs it on every start, so a database made
+  # before a table was added gets that table. Every statement in the file is
+  # safe to repeat.
+  postgres-init:
+    image: postgres:17
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: neuro
+    volumes:
+      - ./db/schema.sql:/schema.sql:ro
+    entrypoint: ["psql", "-h", "postgres", "-U", "neuro", "-d", "neuro", "-q", "-v", "ON_ERROR_STOP=1", "-f", "/schema.sql"]
+
   gateway:
     build:
       context: .
@@ -71,8 +87,8 @@ services:
     depends_on: &backends
       kafka-init:
         condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
 
   processor:
     build:

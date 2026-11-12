@@ -8,6 +8,6 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Python's protoc also runs in Docker: this machine's application control
 # policy blocks the compiler's DLL on the host. The version matches uv.lock.
-docker run --rm -v "${root}:/src" -w /src/replayer ghcr.io/astral-sh/uv:python3.12-bookworm-slim sh -c "uv run --no-project --with grpcio-tools==1.85.1 python -m grpc_tools.protoc -I ../proto --python_out=. --grpc_python_out=. neuro/v1/*.proto"
+docker run --rm -v "${root}:/src" -w /src/replayer ghcr.io/astral-sh/uv:python3.12-bookworm-slim sh -c 'uv run --no-project --with grpcio-tools==1.85.1 python -m grpc_tools.protoc -I ../proto --python_out=. --grpc_python_out=. $(cd ../proto && ls neuro/v1/*.proto)'
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 "generated: gen/neuro/v1 (Go), replayer/neuro/v1 (Python)"

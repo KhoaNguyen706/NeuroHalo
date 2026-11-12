@@ -21,6 +21,7 @@ import (
 const (
 	featuresTopic = "eeg.features"
 	eventsTopic   = "eeg.events"
+	epochsTopic   = "eeg.epochs"
 	storeGroup    = "api-store"
 
 	rollupSeconds  = 10
@@ -73,11 +74,12 @@ func (b *bucket) add(f *neurov1.FeatureFrame) {
 	}
 }
 
-// store is the api-store consumer: it writes events and 10-second rollups to
-// Postgres, and commits Kafka offsets only for what is written.
+// store is the api-store consumer: it writes events, epochs and 10-second
+// rollups to Postgres, and commits Kafka offsets only for what is written.
 // Created by: main.
 // Used by: run, handle, handleEvent, handleFrame, session, flush, flushIdle,
-// writeEvents, commit, dropPartitions (its methods).
+// writeEvents, commit, dropPartitions (its methods), and handleEpoch,
+// writeEpochs (its methods in responses.go).
 type store struct {
 	kafka *kgo.Client
 	db    *pgxpool.Pool
@@ -85,6 +87,7 @@ type store struct {
 	meta   map[string]*sessionMeta // nil value: session is not in Postgres, skip it
 	open   map[string]*bucket      // by session ID
 	events []*neurov1.Event        // read this poll, not written yet
+	epochs []*neurov1.Epoch        // read this poll, not written yet
 
 	// Offset after the last record handled, per topic and partition.
 	next  map[string]map[int32]int64
@@ -97,7 +100,7 @@ func newStore(db *pgxpool.Pool) *store {
 		db:   db,
 		meta: map[string]*sessionMeta{},
 		open: map[string]*bucket{},
-		next: map[string]map[int32]int64{featuresTopic: {}, eventsTopic: {}},
+		next: map[string]map[int32]int64{featuresTopic: {}, eventsTopic: {}, epochsTopic: {}},
 	}
 }
 
@@ -151,13 +154,16 @@ func (s *store) session(ctx context.Context, id string) (*sessionMeta, error) {
 	return m, nil
 }
 
-// handle routes one record to the event or frame handler and remembers its
-// offset for the next commit.
+// handle routes one record to the event, epoch or frame handler and
+// remembers its offset for the next commit.
 func (s *store) handle(ctx context.Context, rec *kgo.Record) error {
 	s.next[rec.Topic][rec.Partition] = rec.Offset + 1
 	s.dirty = true
-	if rec.Topic == eventsTopic {
+	switch rec.Topic {
+	case eventsTopic:
 		return s.handleEvent(ctx, rec)
+	case epochsTopic:
+		return s.handleEpoch(ctx, rec)
 	}
 	return s.handleFrame(ctx, rec)
 }
@@ -356,8 +362,8 @@ func (s *store) dropPartitions(_ context.Context, _ *kgo.Client, gone map[string
 	}
 }
 
-// run is the consumer loop: fetch, handle each record, write events, write
-// idle buckets, commit, repeat. It polls at least once a second so idle
+// run is the consumer loop: fetch, handle each record, write events and
+// epochs, write idle buckets, commit, repeat. It polls at least once a second so idle
 // buckets are written on time. Kafka rebalances wait until a pass is finished.
 func (s *store) run(ctx context.Context) error {
 	for {
@@ -381,6 +387,9 @@ func (s *store) run(ctx context.Context) error {
 		})
 		if err == nil {
 			err = s.writeEvents(ctx)
+		}
+		if err == nil {
+			err = s.writeEpochs(ctx)
 		}
 		if err == nil {
 			err = s.flushIdle(ctx)
