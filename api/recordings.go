@@ -9,7 +9,6 @@ import (
 	"errors"
 	"log"
 	"net/http"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/minio/minio-go/v7"
@@ -26,16 +25,9 @@ type recordingJSON struct {
 	Seconds float64 `json:"seconds"` // the signal it holds, once ready
 }
 
-// downloadName turns a session ID into a safe file name: letters, digits,
-// '.', '-' and '_' are kept, anything else becomes '_'.
+// downloadName turns a session ID into a safe file name (see safeName).
 func downloadName(id string) string {
-	return strings.Map(func(r rune) rune {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == '_':
-			return r
-		}
-		return '_'
-	}, id) + ".edf"
+	return safeName(id) + ".edf"
 }
 
 // getRecording handles GET /sessions/{id}/recording.edf: the session's raw

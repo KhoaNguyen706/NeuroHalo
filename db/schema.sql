@@ -15,6 +15,21 @@ CREATE TABLE IF NOT EXISTS sessions (
 -- For databases created before last_seq existed.
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_seq bigint;
 
+-- A study groups sessions for export as one BIDS dataset. Inside a study each
+-- session is tagged with who was recorded (participant) and what they did
+-- (task); both become part of the file names, so they are letters and digits
+-- only, as BIDS requires. Several sessions of one participant and task
+-- become runs 1, 2, ... in the order they started.
+CREATE TABLE IF NOT EXISTS studies (
+  id         text PRIMARY KEY,
+  name       text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS study_id text REFERENCES studies(id);
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS participant text NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS task text NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS sessions_study ON sessions (study_id) WHERE study_id IS NOT NULL;
+
 -- The raw signal of each session, kept by the recorder. While the session
 -- runs, its batches go to the object store as chunks (spool/<id>/...); once it
 -- has ended they are merged into one EDF+ file (recordings/<id>.edf).

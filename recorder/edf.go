@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/neurohalo/neurohalo/internal/recording"
 )
 
 const (
@@ -215,7 +217,7 @@ func writeEDF(w io.Writer, f *edfFile, rows io.Reader) error {
 		}
 		h.field(annotationValue, width)
 	}
-	each(16, func(c int) string { return f.names[c] }, annotationLabel)
+	each(16, func(c int) string { return recording.EDFLabel(f.names[c]) }, annotationLabel)
 	each(80, func(int) string { return "" }, "")           // transducer
 	each(8, func(int) string { return "uV" }, "")          // physical unit
 	each(8, func(c int) string { return loText[c] }, "-1") // physical minimum

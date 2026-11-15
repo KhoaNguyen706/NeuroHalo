@@ -22,8 +22,8 @@ export const BAND_SYMBOL: Record<Band, string> = { delta: "δ", theta: "θ", alp
 // Quality codes, as in the proto enum.
 export const QUALITY_NAME: Record<number, string> = { 0: "unknown", 1: "ok", 2: "flat", 3: "noisy" };
 
-// One session. Returned by: api.sessions, api.session. Used by: the home page
-// list and the session page.
+// One session. Returned by: api.sessions, api.session, api.setStudy; part of
+// StudyDetail. Used by: the home page list, the session page and the study page.
 export type Session = {
   id: string;
   label: string;
@@ -34,7 +34,22 @@ export type Session = {
   endedAt: string | null;
   status: "live" | "ended";
   recording: Recording | null; // null until the recorder has stored the first second
+  studyId: string; // "" when the session is in no study
+  participant: string; // who was recorded, inside the study
+  task: string; // what they did
 };
+
+// One study in the list. Returned by: api.studies. Used by: the studies page.
+export type Study = { id: string; name: string; createdAt: string; sessions: number };
+
+// One study with its sessions, ordered by participant, task and start time.
+// Returned by: api.study. Used by: the study page.
+export type StudyDetail = { id: string; name: string; createdAt: string; sessionList: Session[] };
+
+// BIDS_LABEL is what a participant or task may be: letters and digits only,
+// because they become part of the file names. The api checks the same rule.
+// Used by: the study page.
+export const BIDS_LABEL = /^[A-Za-z0-9]{1,32}$/;
 
 // The recorder's EDF file of a session's raw signal. Part of: Session.
 // Used by: the session page, which offers the download once it is ready.
@@ -134,6 +149,7 @@ export class ApiError extends Error {
 }
 
 // call sends one request with the token and returns the parsed JSON body.
+// Used by: every method of api, and by send.
 async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(API_URL + path, {
     ...init,
@@ -148,6 +164,11 @@ async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 const enc = encodeURIComponent;
+
+// send makes a call with a JSON body.
+function send<T>(method: string, path: string, body: unknown): Promise<T> {
+  return call<T>(path, { method, body: JSON.stringify(body), headers: { "Content-Type": "application/json" } });
+}
 
 export const api = {
   sessions: () => call<Session[]>("/sessions"),
@@ -181,7 +202,22 @@ export const api = {
     form.append("speed", speed);
     return call<{ sessionId: string }>("/uploads", { method: "POST", body: form });
   },
+  studies: () => call<Study[]>("/studies"),
+  study: (id: string) => call<StudyDetail>(`/studies/${enc(id)}`),
+  createStudy: (name: string) => send<{ id: string }>("POST", "/studies", { name }),
+  // deleteStudy removes a study; its sessions stay, untagged.
+  deleteStudy: (id: string) => call<{ deleted: string }>(`/studies/${enc(id)}`, { method: "DELETE" }),
+  // setStudy files a session in a study with its participant and task, or
+  // takes it out of its study when studyId is "".
+  setStudy: (sessionId: string, studyId: string, participant = "", task = "") =>
+    send<Session>("PUT", `/sessions/${enc(sessionId)}/study`, { studyId, participant, task }),
 };
+
+// bidsUrl is the download address of a study as a BIDS dataset (a zip). A
+// plain link cannot set headers, so the token travels in the query string.
+export function bidsUrl(id: string): string {
+  return `${API_URL}/studies/${enc(id)}/bids.zip?token=${enc(TOKEN)}`;
+}
 
 // recordingUrl is the download address of a session's EDF file. A plain link
 // cannot set headers, so the token travels in the query string.
