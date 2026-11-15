@@ -673,7 +673,9 @@ An epoch is dropped when its marker comes before the buffer is full (the first 2
 
 Measured on 2026-11-12 with the sample "Left and right fist": 29 of 30 markers gave an epoch (the first marker is at sample 0, with nothing before it). At sensors C3 and C4, over the movement area, alpha fell 50 to 70% about 1 to 1.5 s after the fist cues `T1` and `T2` and rose after the rest cue `T0`, which is the result the literature reports for this task. With 7 or 8 trials per label the left/right difference is not clear.
 
-Limits, for anyone using it as a result: a 1-second window blurs timing to about a second; the bad-sensor rule is the same simple threshold as the live view, so eye blinks reach the frontal sensors' averages; no statistics are computed; and the numbers have not been compared against MNE or EEGLAB on the same file.
+Limits, for anyone using it as a result: a 1-second window blurs timing to about a second; the bad-sensor rule is the same simple threshold as the live view, so eye blinks reach the frontal sensors' averages; and no statistics are computed.
+
+Checked on 2026-11-14 with `replayer/check_responses.py`, which recomputes every epoch from the original file without NeuroHalo code: MNE reads the file and its annotations, the windows are cut at the same samples, and MNE's `psd_array_welch` (one Hann segment per window) gives the band power. Same file, replayed whole: the same 29 trials, the same sensors left out of each, and in all 5 bands, 3 labels, 64 sensors and 21 steps the averaged power equals MNE's times 4,800 to within 1.4 × 10⁻⁷. That factor is not fitted luck: MNE reports µV²/Hz, and turning a Hann-windowed FFT into that divides by sample rate × Σ window² ÷ 2 = 160 × 60 ÷ 2. The change from before the marker, which is what the page shows, matches within 0.0001 percentage points.
 
 # Eye movements and muscle activity
 

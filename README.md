@@ -63,6 +63,15 @@ Latency is measured from the moment a batch is sent to the moment its result rea
 
 ![The Grafana dashboard during the load test](docs/img/dashboard.png)
 
+## Checked against MNE
+
+Each output is recomputed from the original file with MNE, the Python library many EEG labs analyse with, and compared number by number. Both checks were run on the "Left and right fist" sample (64 sensors, 125 s, 30 markers).
+
+| Output | Check | Result |
+| --- | --- | --- |
+| The recorded EDF+ file | `replayer/check_recording.py`: read with MNE, compared with the file that was replayed | All 20,000 samples of all 64 sensors within 0.008 µV (half a step of the 16-bit scale), all 30 markers on their own sample |
+| The averaged response per marker label | `replayer/check_responses.py`: the same epochs cut and averaged with MNE's Welch spectrum | Same 29 trials and the same sensors left out of each. In all 5 bands, 3 labels, 64 sensors and 21 time steps the power is exactly 4,800 × MNE's µV²/Hz (the Hann window's scale at 160 Hz), within 1.4 × 10⁻⁷. The change from before the marker matches within 0.0001 percentage points |
+
 ## When a service dies
 
 The processors share the Kafka topic as one consumer group. Kill one, and Kafka hands its partitions to the others, which read on from the last committed offset. The recorder commits only after a chunk is stored, so after a crash Kafka delivers the rest again and the recorder drops the copies by sequence number.
