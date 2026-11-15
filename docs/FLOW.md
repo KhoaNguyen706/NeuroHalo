@@ -489,6 +489,7 @@ Take sensor `O1`, seconds 30.0 to 30.1 of the eyes-closed recording:
 | A batch goes missing | The processor clears that session's buffer and counts a gap; windows resume 2 s later | `session.add` |
 | Processor crashes | Its output was not committed, so Kafka gives the batches again; buffers refill in 2 s | `processor.run` |
 | Api crashes mid-bucket | Offsets were held at the bucket's first frame, so the bucket is rebuilt whole | `store.commit` |
+| Api is stopped or redeployed | The store loop allows the group's rebalance as it exits, so `kafka.Close()` leaves the group at once and the next api takes over the partitions in seconds. Before this was fixed (2026-11-14), Close hung until Docker killed the process, and the next api stored nothing for about 45 s, Kafka's session timeout. Once, the store stayed stuck for over 5 minutes until the api was restarted; that was not reproduced | `store.run` |
 | Postgres down | Processor and api retry with backoff and hold their offsets | `loadSession`, `retry` |
 | Recorder crashes | Batches since its last flush were not committed, so Kafka gives them again; the merge drops any copies. Tested with `scripts/recorder_crash.ps1` | `recorder.flush`, `merger.add` |
 | File storage down | The recorder retries the chunk upload and holds its offsets, so Kafka keeps the batches; the live view is unaffected | `recorder.upload`, `retry` |
@@ -744,7 +745,7 @@ A lab does not want 40 loose sessions; it wants "participant 07, resting task, s
 | `participants.tsv` | one `sub-<label>` per participant |
 | `task-<task>_events.json` | what the `trial_type` and `sample` columns mean; one per task, inherited by every run of it |
 | `sub-<p>/eeg/..._eeg.json` | task, sample rate, sensor count, duration. Reference, mains frequency and amplifier filters are `n/a`: NeuroHalo is not told them |
-| `..._channels.tsv` | every sensor as `EEG`, `µV`, under the name the EDF header gives it (`recording.EDFLabel`, shared with the recorder: printable ASCII, 16 characters) |
+| `..._channels.tsv` | every sensor as `EEG`, `µV`, under the name the EDF header gives it (`recording.EDFLabel`, shared with the recorder: printable ASCII, 16 characters), with `status` and `status_description` from the live check (below) |
 | `..._events.tsv` | one line per marker: onset and duration in seconds, label, sample |
 | `..._eeg.edf` | the recorder's file, copied unchanged from file storage |
 
@@ -754,7 +755,13 @@ The zip is written straight into the response, the EDF files streamed from file 
 
 Checked on 2026-11-14 on a study of 4 recordings (two "fist" runs of participant 01, rest for 02 and 03) plus one session still recording. The official BIDS validator 3.0.2 reported no errors; its warnings ask for authors, equipment software versions and HED tags, which only the lab knows. MNE-BIDS read every recording back: 3 participants, 2 tasks, 64 sensors at 160 Hz each, and all 30 markers per fist run. The session still recording was left out and named in the README.
 
-Limits: no session level (`ses-`), so a participant's visits on different days become runs of one session; every sensor is typed EEG, even an eye or heart channel; nothing about the participants (age, sex) is collected; and bad sensors found live are not yet written to `channels.tsv`.
+**Bad sensors (`sensorStatus`).** The processor already flags a sensor while the session runs (`channel_bad` after 3 flat or noisy windows in a row, `channel_recovered` after 3 good ones). Each event carries its window number, and window `w` ends at sample `w × hop`, so the export knows on the recording's own clock when every flag began and ended. `sensorStatus()` adds up each sensor's flagged stretches, to the next recovery or to the end of the recording. A sensor flagged for more than half the recording (`badShare`) gets `status` `bad`; MNE-BIDS puts it straight into `raw.info["bads"]`, so analyses leave it out without anyone marking it by hand. Every flagged sensor gets a `status_description` such as "flagged flat by the live check for 38 of 61 s (62%), from 23 s", so a lab with a stricter rule can apply its own.
+
+Checked on 2026-11-14 with the sample where Cz fails at 20 s: Cz came out `bad`, "flat … from 23 s" (the 2-second window must be wholly flat, then 3 windows in a row confirm it), and MNE-BIDS read `bads = ['Cz']`. The BIDS validator still reported no errors.
+
+A caution found on the same run: in the "Left and right fist" recordings the forehead sensors Fp1, Fp2, AF7 and AF3 come out `bad`, noisy for 51 to 63% of the time. They sit above the eyes, so this is almost certainly blinking at each cue, not a broken sensor. Labs usually keep those sensors and remove blinks later (for example with ICA). The noisy rule (500 µV peak to peak) cannot tell the two apart yet.
+
+Limits: no session level (`ses-`), so a participant's visits on different days become runs of one session; every sensor is typed EEG, even an eye or heart channel; nothing about the participants (age, sex) is collected; and the bad-sensor status mistakes heavy blinking for a noisy sensor, as above.
 
 # Not built yet
 

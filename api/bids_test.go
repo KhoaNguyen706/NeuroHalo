@@ -46,9 +46,10 @@ func TestBIDSMetadata(t *testing.T) {
 		files[f.Path] = string(f.Body)
 	}
 	checks := map[string]string{
-		"participants.tsv":                          "participant_id\nsub-01\nsub-02\n",
-		"sub-01/eeg/sub-01_task-fists_channels.tsv": "name\ttype\tunits\nC3\tEEG\tµV\nCz\tEEG\tµV\na very long sens\tEEG\tµV\n",
-		"sub-01/eeg/sub-01_task-fists_events.tsv":   "onset\tduration\ttrial_type\tsample\n4.2\t4.2\tT1\t672\n8.4\t0\twith tab\t1344\n",
+		"participants.tsv": "participant_id\nsub-01\nsub-02\n",
+		"sub-01/eeg/sub-01_task-fists_channels.tsv": "name\ttype\tunits\tstatus\tstatus_description\n" +
+			"C3\tEEG\tµV\tgood\tn/a\nCz\tEEG\tµV\tgood\tn/a\na very long sens\tEEG\tµV\tgood\tn/a\n",
+		"sub-01/eeg/sub-01_task-fists_events.tsv": "onset\tduration\ttrial_type\tsample\n4.2\t4.2\tT1\t672\n8.4\t0\twith tab\t1344\n",
 	}
 	for path, want := range checks {
 		if got := files[path]; got != want {
@@ -71,5 +72,40 @@ func TestBIDSMetadata(t *testing.T) {
 	}
 	if !strings.Contains(files["README"], "s-x") || !strings.Contains(files["sub-01/eeg/sub-01_task-fists_eeg.json"], `"SamplingFrequency": 160`) {
 		t.Errorf("README or _eeg.json is missing a value:\n%s\n%s", files["README"], files["sub-01/eeg/sub-01_task-fists_eeg.json"])
+	}
+}
+
+// TestSensorStatus checks how the live check's flags become channels.tsv
+// status: stretches are added up to the next recovery or the end, more than
+// half the recording is bad, and every flagged sensor is described.
+func TestSensorStatus(t *testing.T) {
+	run := bidsRun{
+		Seconds:  100,
+		Channels: []string{"Cz", "O1", "Fp1", "C3"},
+		Flags: []sensorFlag{
+			{Channel: "Fp1", Seconds: 10, Bad: true, Reason: "noisy"},
+			{Channel: "Cz", Seconds: 20.04, Bad: true, Reason: "flat"},
+			{Channel: "Fp1", Seconds: 20},
+			{Channel: "Fp1", Seconds: 50, Bad: true, Reason: "noisy"},
+			{Channel: "Fp1", Seconds: 60, Bad: true, Reason: "flat"}, // still bad, new reason
+			{Channel: "Fp1", Seconds: 70},
+			{Channel: "C3", Seconds: 70, Bad: true, Reason: "noisy"}, // to the end: exactly 30%
+			{Channel: "X9", Seconds: 5, Bad: true, Reason: "flat"},   // not a sensor of this run
+		},
+	}
+	got := run.sensorStatus()
+	want := map[string]sensorState{
+		"Cz":  {true, "flagged flat by the live check for 80 of 100 s (80%), from 20 s"},
+		"O1":  {false, "n/a"},
+		"Fp1": {false, "flagged noisy and flat by the live check for 30 of 100 s (30%), in 2 stretches, the first from 10 s"},
+		"C3":  {false, "flagged noisy by the live check for 30 of 100 s (30%), from 70 s"},
+	}
+	if len(got) != len(want) {
+		t.Errorf("%d sensors, want %d: %v", len(got), len(want), got)
+	}
+	for c, w := range want {
+		if got[c] != w {
+			t.Errorf("%s: %+v, want %+v", c, got[c], w)
+		}
 	}
 }

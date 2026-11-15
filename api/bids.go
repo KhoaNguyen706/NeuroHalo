@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/minio/minio-go/v7"
 
+	"github.com/neurohalo/neurohalo/internal/eeg"
 	"github.com/neurohalo/neurohalo/internal/recording"
 )
 
@@ -31,7 +34,8 @@ import (
 //	  sub-01/eeg/
 //	    sub-01_task-rest_eeg.edf       the recorder's EDF+ file, unchanged
 //	    sub-01_task-rest_eeg.json      sample rate, sensor count, duration
-//	    sub-01_task-rest_channels.tsv  every sensor, as named in the EDF file
+//	    sub-01_task-rest_channels.tsv  every sensor, as named in the EDF file, and
+//	                                   whether the live check found it bad
 //	    sub-01_task-rest_events.tsv    the markers, when there are any
 //
 // Only sessions whose recording is ready are exported; the README names the
@@ -43,7 +47,7 @@ const bidsVersion = "1.10.0"
 
 // bidsRun is one session as it appears in the dataset.
 // Built by: exportBIDS. Numbered by: numberRuns. Used by: bidsMetadata and its
-// helpers (prefix, eegSidecar, channelsTSV, eventsTSV), and exportBIDS, which
+// helpers (prefix, eegSidecar, sensorStatus, channelsTSV, eventsTSV), and exportBIDS, which
 // copies the EDF file.
 type bidsRun struct {
 	SessionID   string
@@ -56,6 +60,28 @@ type bidsRun struct {
 	StartedAt   time.Time
 	ObjectKey   string // the EDF file in the object store
 	Markers     []bidsMarker
+	Flags       []sensorFlag // the live check's events, in recording order
+}
+
+// sensorFlag is one channel_bad or channel_recovered event of a run.
+// Read by: exportBIDS. Used by: sensorStatus.
+type sensorFlag struct {
+	Channel string
+	Seconds float64 // when the live check flagged it, on the recording's clock
+	Bad     bool    // channel_bad; false for channel_recovered
+	Reason  string  // flat or noisy, for channel_bad
+}
+
+// badShare is how much of a recording a sensor must have been flagged for to
+// get status "bad" in channels.tsv: more than half. A sensor flagged for less
+// is still described, so a stricter lab can apply its own rule.
+const badShare = 0.5
+
+// sensorState is what channels.tsv says about one sensor.
+// Built by: sensorStatus. Used by: channelsTSV.
+type sensorState struct {
+	Bad         bool
+	Description string // "n/a" when the live check never flagged it
 }
 
 // bidsMarker is one marker of a run, from the session's "marker" events.
@@ -130,14 +156,85 @@ func (r bidsRun) eegSidecar() []byte {
 	return append(body, '\n')
 }
 
+// sensorStatus turns the run's flags into a state per sensor: the stretches
+// from each channel_bad to the next channel_recovered (or to the end of the
+// recording) are added up, and a sensor flagged for more than badShare of
+// the recording is bad. A flag for a sensor the run does not have is ignored.
+// Used by: channelsTSV.
+func (r bidsRun) sensorStatus() map[string]sensorState {
+	type tally struct {
+		since   float64 // when the current stretch began; -1 while not flagged
+		total   float64 // seconds flagged so far
+		first   float64 // when the first stretch began
+		stretch int     // stretches so far
+		reasons []string
+	}
+	t := map[string]*tally{}
+	for _, c := range r.Channels {
+		t[c] = &tally{since: -1}
+	}
+	end := func(a *tally, at float64) {
+		if a.since >= 0 {
+			a.total += math.Max(0, math.Min(at, r.Seconds)-a.since)
+			a.since = -1
+		}
+	}
+	for _, f := range r.Flags {
+		a := t[f.Channel]
+		switch {
+		case a == nil:
+		case f.Bad:
+			if a.since < 0 {
+				a.since = math.Min(f.Seconds, r.Seconds)
+				if a.stretch == 0 {
+					a.first = a.since
+				}
+				a.stretch++
+			}
+			if !slices.Contains(a.reasons, f.Reason) {
+				a.reasons = append(a.reasons, f.Reason)
+			}
+		default:
+			end(a, f.Seconds)
+		}
+	}
+	out := map[string]sensorState{}
+	for c, a := range t {
+		end(a, r.Seconds)
+		if a.stretch == 0 || r.Seconds <= 0 {
+			out[c] = sensorState{Description: "n/a"}
+			continue
+		}
+		share := a.total / r.Seconds
+		from := seconds(math.Round(a.first*10) / 10)
+		where := "from " + from + " s"
+		if a.stretch > 1 {
+			where = fmt.Sprintf("in %d stretches, the first from %s s", a.stretch, from)
+		}
+		out[c] = sensorState{
+			Bad: share > badShare,
+			Description: fmt.Sprintf("flagged %s by the live check for %.0f of %.0f s (%.0f%%), %s",
+				strings.Join(a.reasons, " and "), a.total, r.Seconds, share*100, where),
+		}
+	}
+	return out
+}
+
 // channelsTSV is the run's _channels.tsv: every sensor under the name the EDF
-// header gives it, all of type EEG in microvolts.
+// header gives it, all of type EEG in microvolts, with its status from the
+// live check (sensorStatus). MNE-BIDS and EEGLAB read status "bad" as a
+// sensor to leave out.
 // Used by: bidsMetadata.
 func (r bidsRun) channelsTSV() []byte {
+	status := r.sensorStatus()
 	var b strings.Builder
-	b.WriteString("name\ttype\tunits\n")
+	b.WriteString("name\ttype\tunits\tstatus\tstatus_description\n")
 	for _, c := range r.Channels {
-		b.WriteString(tsvField(recording.EDFLabel(c)) + "\tEEG\tµV\n")
+		st, word := status[c], "good"
+		if st.Bad {
+			word = "bad"
+		}
+		b.WriteString(tsvField(recording.EDFLabel(c)) + "\tEEG\tµV\t" + word + "\t" + tsvField(st.Description) + "\n")
 	}
 	return []byte(b.String())
 }
@@ -217,7 +314,12 @@ func bidsMetadata(study string, exported time.Time, runs []bidsRun, skipped []st
 		"recording's events.tsv and are also inside the EDF file as annotations. A stretch where no " +
 		"signal arrived is filled with zeros and annotated \"NeuroHalo: no data\" in the EDF file.\n\n" +
 		"The reference sensor, the mains frequency and the amplifier's filters were not known to " +
-		"NeuroHalo and are given as n/a in each _eeg.json.\n")
+		"NeuroHalo and are given as n/a in each _eeg.json.\n\n" +
+		"While recording, NeuroHalo checks every sensor twice a second, over the last 2 seconds: flat " +
+		"(less than 0.5 uV of variation) or noisy (more than 500 uV peak to peak). In each channels.tsv, " +
+		"a sensor flagged for more than half of the recording has status \"bad\", and status_description " +
+		"says for how long and from when any sensor was flagged, so a stricter rule can be applied. " +
+		"The times are when the live check flagged it, up to about 3 seconds after the problem began.\n")
 	if len(skipped) > 0 {
 		readme.WriteString("\nLeft out:\n")
 		for _, s := range skipped {
@@ -365,6 +467,35 @@ func (a *api) exportBIDS(w http.ResponseWriter, r *http.Request) {
 		}
 		run := &runs[byID[sessionID]]
 		run.Markers = append(run.Markers, m)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		serverError(w, r, err)
+		return
+	}
+
+	// The live check's flags. Each carries its analysis window, which ends at
+	// sample window x hop: an exact time on the recording's clock.
+	rows, err = a.db.Query(ctx, `
+		SELECT session_id, channel, type = 'channel_bad', (details->>'window')::bigint, COALESCE(details->>'reason', '')
+		FROM events WHERE type IN ('channel_bad', 'channel_recovered') AND session_id = ANY($1)
+		ORDER BY session_id, (details->>'window')::bigint, id`, ids)
+	if err != nil {
+		serverError(w, r, err)
+		return
+	}
+	for rows.Next() {
+		var sessionID string
+		var f sensorFlag
+		var window int64
+		if err := rows.Scan(&sessionID, &f.Channel, &f.Bad, &window, &f.Reason); err != nil {
+			rows.Close()
+			serverError(w, r, err)
+			return
+		}
+		run := &runs[byID[sessionID]]
+		f.Seconds = float64(window*int64(eeg.HopSamples(run.RateHz))) / run.RateHz
+		run.Flags = append(run.Flags, f)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
