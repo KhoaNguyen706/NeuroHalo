@@ -3,7 +3,7 @@
 // The session page: the 3D head with a band strength chart under it, and a
 // rail with the data quality, a band selector, toggles for signal correlation,
 // the flat sensor map and (when the session has markers) the averaged
-// response, the event list and the CSV exports. While the session is live, frames
+// response, the event list, the CSV exports and the recording download. While the session is live, frames
 // stream in over the WebSocket. Once it has ended, the page shows the stored
 // 10-second averages, with a playhead on the chart to move through them.
 
@@ -19,7 +19,7 @@ import { BASELINE_SECONDS, useBaseline } from "@/hooks/useBaseline";
 import { useLiveSession, type HistoryFrame } from "@/hooks/useLiveSession";
 import { useResponses } from "@/hooks/useResponses";
 import {
-  api, BANDS, QUALITY_NAME, type Band, type LiveEvent, type LiveFrame, type Rollup, type Session,
+  api, BANDS, QUALITY_NAME, recordingUrl, type Band, type LiveEvent, type LiveFrame, type Rollup, type Session,
 } from "@/lib/api";
 import { exportAverages, exportEvents } from "@/lib/export";
 import { change, clock, parseClock, percent, sessionName } from "@/lib/format";
@@ -31,6 +31,8 @@ const HeadScene = dynamic(() => import("@/components/HeadScene"), { ssr: false }
 
 const NO_NAMES: string[] = []; // one shared empty list, so HeadScene's props stay the same between renders
 const SESSION_POLL_MS = 1000;
+const RECORDING_POLL_MS = 2000;
+const RECORDING_FIRST_CHUNK_MS = 20_000; // how long after the end a recording may still be missing
 const HISTORY_SETTLE_MS = 20_000; // how long after a session ends its stored averages may still change
 const HISTORY_POLL_MS = 2000;
 const STALE_AFTER_MS = 5000; // no frame for this long: check whether the session has ended
@@ -206,6 +208,19 @@ function SessionView({ id }: { id: string }) {
     }, STALE_AFTER_MS);
     return () => clearTimeout(timer);
   }, [isLive, id, live.elapsedSeconds, live.status]);
+
+  // The recording is written a few seconds after the session ends: ask again
+  // until it is ready or has failed. A session with no recording a while after
+  // its end has none (its source is not recorded).
+  const recordingStatus = session?.recording?.status ?? null;
+  useEffect(() => {
+    if (!ended || recordingStatus === "ready" || recordingStatus === "failed") return;
+    if (recordingStatus === null && Date.now() > Date.parse(session?.endedAt ?? "") + RECORDING_FIRST_CHUNK_MS) return;
+    const timer = setTimeout(() => {
+      api.session(id).then(setSession).catch(() => {});
+    }, RECORDING_POLL_MS);
+    return () => clearTimeout(timer);
+  }, [ended, recordingStatus, session, id]);
 
   // Stored events: once when the session is found, and again when it ends.
   // They cover what happened before this page was opened.
@@ -579,7 +594,7 @@ function SessionView({ id }: { id: string }) {
           Signal correlation
         </button>
 
-        {/* Raw samples are not stored, so the raw signal exists only while a session is live. To see it for a past moment, replay that stretch. */}
+        {/* The raw signal is drawn from the live stream only. An ended session's raw signal is in its EDF download. */}
         <button type="button" className={styles.toggle} aria-pressed={raw && isLive} disabled={ended}
           onClick={() => setRaw((on) => !on)}>
           Raw signal
@@ -641,6 +656,7 @@ function SessionView({ id }: { id: string }) {
           <div className={styles.exports}>
             <button type="button" onClick={() => exportAverages(session).catch(() => {})}>Averages CSV</button>
             <button type="button" onClick={() => exportEvents(session).catch(() => {})}>Events CSV</button>
+            {session.recording?.status === "ready" && <a href={recordingUrl(session.id)}>Recording EDF</a>}
           </div>
         )}
       </aside>

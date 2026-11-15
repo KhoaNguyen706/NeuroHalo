@@ -170,8 +170,8 @@
   cursor: default;
 }
 
-/* The chart's line choice (All, Regions, Left / right) and the CSV exports:
-   small text buttons, accent when chosen. */
+/* The chart's line choice (All, Regions, Left / right) and the exports (two
+   CSV files and the recording): small text buttons, accent when chosen. */
 .modes,
 .exports {
   display: flex;
@@ -183,13 +183,15 @@
 }
 
 .modes button,
-.exports button {
+.exports button,
+.exports a {
   padding: 0;
   border: none;
   background: none;
   color: var(--ink-2);
   font: inherit;
   font-size: var(--small);
+  text-decoration: none;
   cursor: pointer;
 }
 
@@ -197,12 +199,14 @@
   color: var(--accent);
 }
 
-.exports button:hover {
+.exports button:hover,
+.exports a:hover {
   color: var(--ink);
 }
 
 .modes button:focus-visible,
-.exports button:focus-visible {
+.exports button:focus-visible,
+.exports a:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: 3px;
 }

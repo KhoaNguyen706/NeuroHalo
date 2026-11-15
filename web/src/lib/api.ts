@@ -33,6 +33,15 @@ export type Session = {
   startedAt: string;
   endedAt: string | null;
   status: "live" | "ended";
+  recording: Recording | null; // null until the recorder has stored the first second
+};
+
+// The recorder's EDF file of a session's raw signal. Part of: Session.
+// Used by: the session page, which offers the download once it is ready.
+export type Recording = {
+  status: "recording" | "writing" | "ready" | "failed";
+  bytes: number; // the file's size, once ready
+  seconds: number; // the signal it holds, once ready
 };
 
 // A stored event. Returned by: api.events. Turned into a SessionEvent by fromStored.
@@ -173,6 +182,12 @@ export const api = {
     return call<{ sessionId: string }>("/uploads", { method: "POST", body: form });
   },
 };
+
+// recordingUrl is the download address of a session's EDF file. A plain link
+// cannot set headers, so the token travels in the query string.
+export function recordingUrl(id: string): string {
+  return `${API_URL}/sessions/${enc(id)}/recording.edf?token=${enc(TOKEN)}`;
+}
 
 // liveUrl is the WebSocket address for one session. Browsers cannot set
 // headers on a WebSocket, so the token travels in the query string.

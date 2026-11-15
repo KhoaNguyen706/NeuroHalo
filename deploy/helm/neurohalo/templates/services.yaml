@@ -1,4 +1,4 @@
-# The five NeuroHalo programs: gateway, processor, api, worker and web.
+# The six NeuroHalo programs: gateway, processor, recorder, api, worker and web.
 apiVersion: v1
 kind: Service
 metadata:
@@ -64,6 +64,38 @@ spec:
             - { name: KAFKA_BROKERS, value: "kafka:9092" }
             - { name: DATABASE_URL, value: {{ include "neurohalo.databaseUrl" . | quote }} }
             - { name: LINKS_ENABLED, value: {{ .Values.processor.linksEnabled | quote }} }
+---
+# The recorder has no Service either. It reads eeg.raw as consumer group
+# "recorder" and keeps everything in the object store, so a replacement pod
+# carries on where the last one stopped.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recorder
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: recorder }
+  template:
+    metadata:
+      labels: { app: recorder }
+    spec:
+      enableServiceLinks: false
+      initContainers:
+        {{- include "neurohalo.waitForTopics" . | nindent 8 }}
+      containers:
+        - name: recorder
+          image: neurohalo-recorder:{{ .Values.imageTag }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: metrics, containerPort: 9100 }
+          env:
+            - { name: KAFKA_BROKERS, value: "kafka:9092" }
+            - { name: DATABASE_URL, value: {{ include "neurohalo.databaseUrl" . | quote }} }
+            - { name: S3_ENDPOINT, value: "storage:8333" }
+            - { name: S3_ACCESS_KEY, value: {{ .Values.storage.accessKey | quote }} }
+            - { name: S3_SECRET_KEY, value: {{ .Values.storage.secretKey | quote }} }
+            - { name: S3_BUCKET, value: {{ .Values.storage.bucket | quote }} }
 ---
 apiVersion: v1
 kind: Service

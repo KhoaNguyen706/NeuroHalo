@@ -168,13 +168,22 @@ func (s *server) saveSession(ctx context.Context, h *neurov1.SessionHeader) erro
 }
 
 // endSession marks a session as ended in Postgres after its stream closes
-// cleanly. A failure is only logged, because the data is already in Kafka.
-func (s *server) endSession(id string) {
+// cleanly, with the seq of the last batch this stream stored. The recorder
+// waits for that batch before it writes the session's file. A stream that
+// sent no batches keeps the last_seq of an earlier stream. A failure is only
+// logged, because the data is already in Kafka.
+func (s *server) endSession(id string, summary *neurov1.IngestSummary) {
+	var lastSeq *int64
+	if summary.BatchesReceived > 0 {
+		v := int64(summary.LastSeq)
+		lastSeq = &v
+	}
 	// The stream's own context is already finished here, so use a fresh one.
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
 	if _, err := s.db.Exec(ctx,
-		`UPDATE sessions SET status = 'ended', ended_at = now() WHERE id = $1`, id); err != nil {
+		`UPDATE sessions SET status = 'ended', ended_at = now(), last_seq = COALESCE($2, last_seq) WHERE id = $1`,
+		id, lastSeq); err != nil {
 		log.Printf("session %s: could not mark ended: %v", id, err)
 	}
 }
@@ -229,7 +238,7 @@ func (s *server) Stream(stream grpc.ClientStreamingServer[neurov1.IngestRequest,
 	for {
 		req, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
-			s.endSession(header.SessionId)
+			s.endSession(header.SessionId, &summary)
 			log.Printf("session %s: stream closed, %d batches, last seq %d",
 				header.SessionId, summary.BatchesReceived, summary.LastSeq)
 			return stream.SendAndClose(&summary)

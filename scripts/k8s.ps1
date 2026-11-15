@@ -1,4 +1,4 @@
-# Run the stack on Kubernetes, in a local kind cluster, with the Helm chart
+r# Run the stack on Kubernetes, in a local kind cluster, with the Helm chart
 # in deploy/helm/neurohalo.
 #   scripts/k8s.ps1 up      # create the cluster, build and load the images, install the chart
 #   scripts/k8s.ps1 demo    # play 6 sessions, kill a processor pod mid-way, report what was stored
@@ -12,7 +12,7 @@ $root = Split-Path -Parent $PSScriptRoot
 $bin = "$root/bin"
 $cluster = 'neurohalo'
 $context = "kind-$cluster"
-$images = 'gateway', 'processor', 'api', 'worker', 'web'
+$images = 'gateway', 'processor', 'recorder', 'api', 'worker', 'web'
 $api = @{ Authorization = 'Bearer dev-token' }
 
 # Return the path of kind or helm: the installed one, or a copy downloaded into bin/.

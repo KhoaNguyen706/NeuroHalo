@@ -16,6 +16,7 @@ It is a streaming pipeline first: gRPC in, Kafka in the middle, WebSocket out. R
 - **Flag eye movements and muscle activity:** the two most common kinds of non-brain signal are listed as they start. The rules are simple thresholds, not checked against hand-labelled data.
 - **See the experiment's markers:** when the recording or the live stream says "a cue was shown here", that moment is placed on the exact sample it belongs to, shown on the chart and kept in the event history.
 - **See the averaged response build up:** the signal around every marker is cut out and averaged per label while the session runs, so the response to a cue shows after a handful of trials.
+- **Keep the raw signal:** every session is saved as an EDF+ file, the format EEGLAB, MNE and EDFbrowser open, with the markers inside it. It can be downloaded a few seconds after the session ends, including sessions from a live amplifier.
 - **Go back:** an ended session is stored as 10-second averages and events. Move a playhead through it, export CSV, or replay any stretch as a new live session.
 
 ## How it is built
@@ -28,6 +29,8 @@ flowchart LR
     P --> FEAT[[eeg.features]]
     P --> EV[[eeg.events]]
     P --> EP[[eeg.epochs]]
+    RAW --> REC[recorder<br/>Go]
+    REC -- "EDF+ file<br/>per session" --> S3[(file storage<br/>S3 API)]
     EP --> API
     FEAT --> API[api<br/>Go]
     EV --> API
@@ -39,10 +42,11 @@ flowchart LR
 | --- | --- |
 | gateway | Checks the token, validates every batch, waits for Kafka's confirmation. Computes nothing |
 | processor | FFT per sensor over a sliding 2-second window: band power, quality flags, events, and the signal around each marker |
+| recorder | Reads the same raw stream as its own consumer group. Uploads each session's batches every 2 seconds, then writes one EDF+ file when the session ends |
 | api | Two Kafka consumers: one pushes frames to browsers, one writes history to Postgres. The live view never waits on the database |
 | web | Next.js and React Three Fiber |
 
-Every Kafka message is keyed by session ID, so one session's data stays in order. Every step is at-least-once, and duplicates are made harmless at each layer: sequence numbers in the processor, a unique constraint on events, and guarded upserts on rollups. [`docs/FLOW.md`](docs/FLOW.md) walks through the code function by function, including what happens when each piece fails.
+Every Kafka message is keyed by session ID, so one session's data stays in order. Every step is at-least-once, and duplicates are made harmless at each layer: sequence numbers in the processor and the recorder, a unique constraint on events, and guarded upserts on rollups. [`docs/FLOW.md`](docs/FLOW.md) walks through the code function by function, including what happens when each piece fails.
 
 ## Load test
 
@@ -59,13 +63,14 @@ Latency is measured from the moment a batch is sent to the moment its result rea
 
 ![The Grafana dashboard during the load test](docs/img/dashboard.png)
 
-## When a processor dies
+## When a service dies
 
-The processors share the Kafka topic as one consumer group. Kill one, and Kafka hands its partitions to the others, which read on from the last committed offset.
+The processors share the Kafka topic as one consumer group. Kill one, and Kafka hands its partitions to the others, which read on from the last committed offset. The recorder commits only after a chunk is stored, so after a crash Kafka delivers the rest again and the recorder drops the copies by sequence number.
 
 | Test | Result |
 | --- | --- |
 | Docker Compose, 200 sessions, one of two processors killed (`scripts/failover.ps1`) | No stream failed and no batch was lost. The backlog peaked at 13,322 batches and was cleared 20 seconds after the kill |
+| Docker Compose, the recorder killed 30 s into a 2-minute session and kept down for 26 s (`scripts/recorder_crash.ps1`) | The file was complete. Read with MNE and compared with the original: all 20,000 samples of all 64 sensors within 0.008 µV (half a step of the 16-bit scale), all 30 markers on their own sample |
 | Kubernetes (kind), 6 sessions, one of two processor pods force-deleted (`scripts/k8s.ps1 demo`) | A replacement pod was running within 5 seconds. All sessions finished. The two sessions on the killed pod lost 4 seconds of frames each; the other four lost none |
 
 ## Live input

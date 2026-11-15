@@ -24,6 +24,8 @@ flowchart LR
     P -- "FeatureFrame<br/>every 0.5 s" --> FEAT[[eeg.features]]
     P -- "Event" --> EV[[eeg.events]]
     P -- "Epoch<br/>per marker" --> EP[[eeg.epochs]]
+    RAW --> REC[recorder<br/>Go]
+    REC -- "chunks, then<br/>one EDF+ file" --> S3
     FEAT --> API
     EV --> API
     EP --> API
@@ -31,7 +33,7 @@ flowchart LR
     API -- "WebSocket: live frames<br/>REST: history" --> WEB
 ```
 
-One recording becomes a live stream, and the stream becomes rhythm strength and events. Those go two ways at once: straight to the browser over a WebSocket, and into Postgres for history. The live path never waits on the database.
+One recording becomes a live stream, and the stream becomes rhythm strength and events. Those go two ways at once: straight to the browser over a WebSocket, and into Postgres for history. The live path never waits on the database. Next to the processor, the recorder reads the same raw stream and keeps it as one EDF+ file per session.
 
 A session can start three ways, and all three feed the same pipeline: a built-in sample, an uploaded file, or the replayer run by hand in a terminal.
 
@@ -43,9 +45,10 @@ A session can start three ways, and all three feed the same pipeline: a built-in
 | replay worker | `replayer/worker.py` | Picks up replay jobs (samples and uploads) and runs the replayer for each |
 | gateway | `gateway/` | Checks the token, validates every batch, forwards it to Kafka. Computes nothing |
 | processor | `processor/` | Turns raw samples into band power, quality flags and events. Talks only to Kafka (and reads session details from Postgres) |
-| api | `api/` | Stores events and rollups; serves history over REST; pushes live frames over WebSocket; accepts uploads |
+| recorder | `recorder/` | Keeps the raw signal: chunks in file storage while a session runs, one EDF+ file once it ends |
+| api | `api/` | Stores events and rollups; serves history and recordings over REST; pushes live frames over WebSocket; accepts uploads |
 | web | `web/` | The pages: start a session, then watch it live on a 3D head |
-| file storage | SeaweedFS in Compose | Keeps uploaded EDF files behind the S3 API (S3 itself on AWS) |
+| file storage | SeaweedFS in Compose | Keeps uploaded EDF files and the recorder's files behind the S3 API (S3 itself on AWS) |
 | signal math | `internal/eeg/` | FFT, band power, quality rules; shared by processor and api |
 | contract | `proto/neuro/v1/` | The message formats every piece agrees on |
 | featuretail | `tools/featuretail/` | Terminal viewer for what the processor writes (debugging only) |
@@ -62,6 +65,8 @@ A session can start three ways, and all three feed the same pipeline: a built-in
 | processor → `eeg.features` | `FeatureFrame`: 64 sensors × 5 bands + 64 quality flags | 320 floats | 2 a second |
 | processor → `eeg.events` | `Event` (`channel_bad`, `channel_recovered`, `alpha_rise`, `eye_movement`, `muscle`, `marker`) | small | only when something happens |
 | processor → `eeg.epochs` | `Epoch`: 21 windows × 64 sensors × 5 bands around one marker | 6,720 floats ≈ 27 KB | one per marker, 4 s after it |
+| recorder → file storage | one chunk: the session's batches of the last 2 seconds, as they came from Kafka | ≈ 80 KB | one every 2 seconds |
+| recorder → file storage | the EDF+ file: 16 bits per sample | ≈ 20 KB per second of signal | once, after the session ends |
 | api → Postgres | one `rollups` row per 10 seconds, event and epoch rows as they come | | 0.1 rows a second plus events |
 | api → browser | one band of a frame: 64 values + 64 quality flags, as JSON | about 1 KB | 2 a second per viewer |
 
@@ -71,14 +76,15 @@ Every Kafka message is **keyed by `session_id`**. Kafka sends all messages with 
 
 | Table | Written by | Read by |
 | --- | --- | --- |
-| `sessions` | gateway (when the header arrives, and when the stream ends) | processor, api |
+| `sessions` | gateway (when the header arrives, and when the stream ends, with the last `seq`) | processor, recorder, api |
 | `events` | api store consumer | api REST |
 | `rollups` | api store consumer | api REST |
 | `epochs` | api store consumer | api REST (`/responses`) |
+| `recordings` | recorder (progress after every chunk; the file's state once written) | api REST (session state, download) |
 | `replays` | api (queues a job), replay worker (claims it, records the result) | api REST, the session page while it waits |
 | `summaries` | nobody yet (build step 11) | |
 
-Raw samples are never stored in Postgres. The EDF files remain the source.
+Raw samples are never stored in Postgres. They live in file storage: the uploaded or sample EDF file a replay came from, and the recorder's own file of every session.
 
 ## Two clocks
 
@@ -96,7 +102,8 @@ Recording time does not change with replay speed, reconnects or which processor 
 Every step is **at least once**: after a crash, some messages can be read or sent again. Duplicates are made harmless at every layer:
 - the processor drops a batch whose `seq` it has already seen;
 - events have a `UNIQUE` constraint plus `ON CONFLICT DO NOTHING`, and epochs a primary key on session and marker sample;
-- a rollup row is only replaced by one built from at least as many frames.
+- a rollup row is only replaced by one built from at least as many frames;
+- the recorder names each chunk by the `seq` range it holds, and its merge drops any batch at or below the last `seq` it took.
 
 Consumers commit Kafka offsets only **after** their output is written, so nothing is lost.
 
@@ -477,6 +484,9 @@ Take sensor `O1`, seconds 30.0 to 30.1 of the eyes-closed recording:
 | Processor crashes | Its output was not committed, so Kafka gives the batches again; buffers refill in 2 s | `processor.run` |
 | Api crashes mid-bucket | Offsets were held at the bucket's first frame, so the bucket is rebuilt whole | `store.commit` |
 | Postgres down | Processor and api retry with backoff and hold their offsets | `loadSession`, `retry` |
+| Recorder crashes | Batches since its last flush were not committed, so Kafka gives them again; the merge drops any copies. Tested with `scripts/recorder_crash.ps1` | `recorder.flush`, `merger.add` |
+| File storage down | The recorder retries the chunk upload and holds its offsets, so Kafka keeps the batches; the live view is unaffected | `recorder.upload`, `retry` |
+| A stream breaks without a clean end | The recorder writes the file once nothing has arrived for 2 minutes; if the stream comes back, the file is written again | `recorder.claim` |
 | Wrong token | gateway: `UNAUTHENTICATED`; REST: 401 | `authorized`, `requireToken` |
 | Wrong-size batch | `INVALID_ARGUMENT`, stream ends | `validateBatch` |
 | A viewer is slow | It skips to the newest frame; other viewers are unaffected | `viewer.offerFrame` |
@@ -675,6 +685,41 @@ Limits, for anyone using it as a result: a 1-second window blurs timing to about
 | `muscle` | Gamma (30 to 45 Hz) is above 30% of a sensor's power on at least 3 good sensors, for 2 windows in a row |
 
 The 0.1-second smoothing also removes mains hum, which is strong in the sample recordings. The thresholds were set on those recordings (eyes open: 8 eye events a minute; eyes closed: 3 to 6, since eyes also move under closed lids). They are rules of thumb and have not been checked against hand-labelled data. The session page lists both events in the rail; they get no tick on the chart.
+
+# Recording
+
+The pipeline above computes from the raw signal and then lets it go. A lab needs the signal itself, in a file its analysis tools open. The recorder keeps it: every session becomes one EDF+ file, the format EEGLAB, MNE, Brainstorm and EDFbrowser all read, with the markers inside it as annotations.
+
+```mermaid
+flowchart LR
+    RAW[[eeg.raw]] --> H[recorder.handle<br/>add to the session's chunk]
+    H -- "every 2 s" --> F[recorder.flush]
+    F -- "chunk per session" --> S3[(file storage<br/>spool/id/...)]
+    F -- "saved_seq" --> PG[(recordings)]
+    F -- "then commit offsets" --> RAW
+    PG -- "ended, last seq saved" --> C[recorder.claim]
+    C --> M[merger.add<br/>chunks in seq order]
+    M --> E[writeEDF]
+    E -- "recordings/id.edf" --> S3
+    S3 --> D[GET /sessions/id/recording.edf]
+```
+
+**While the session runs (`recorder/main.go`).** The recorder reads `eeg.raw` as its own consumer group, `recorder`. Kafka gives every group all the messages, so the processor and the recorder each see every batch and neither waits for the other. On its very first start the group begins at the newest batch: the oldest ones in `eeg.raw` are whatever retention has not deleted yet, and starting there would write files that silently miss the start of their session.
+1. `handle()` adds each batch, as the bytes Kafka delivered, to its session's `chunk`. It drops a batch whose `seq` it has already taken (the replayer resends 10 batches after a reconnect). A session from source `loadgen` is not recorded (`SKIP_SOURCES`), or a load test would store gigabytes of the same minute.
+2. Every 2 seconds `flush()` uploads each session's chunk to `spool/<id>/<first seq>-<last seq>.bin`, writes the highest `seq` stored per session to `recordings.saved_seq` in one statement, and only then commits the Kafka offsets. If file storage is down it keeps retrying and commits nothing, so Kafka keeps the batches.
+
+**When the session ends (`recorder/finalize.go`).** When the stream closes cleanly, the gateway writes the `seq` of the stream's last batch to `sessions.last_seq`. Every 2 seconds `claim()` marks as `writing` each recording whose session has ended and whose `saved_seq` has reached `last_seq`, so the file is written only once every batch is in a chunk. A session that stopped without a clean end is claimed once it has been quiet for 2 minutes. The claim is one `UPDATE … RETURNING`, so two recorders never write the same file. Then `finalize()`:
+1. Lists the session's chunks. Their names start with the first `seq`, zero-padded, so name order is `seq` order.
+2. Feeds every batch to `merger.add()`, which writes the samples to a temporary file. A batch at or below the last `seq` taken is a copy and is skipped. Samples missing between two batches are written as 0 µV under a `NeuroHalo: no data` annotation, so every later sample keeps its true time. Each marker becomes an annotation at its own sample.
+3. `writeEDF()` reads that file back, writes the EDF+ file in 1-second data records, and uploads it to `recordings/<id>.edf`. Both passes go through disk, so a long session never has to fit in memory.
+
+**The file (`recorder/edf.go`).** EDF keeps each sample as a 16-bit integer, and its header says, per sensor, which range of microvolts the integers span. The recorder knows the whole recording when it writes the header, so it uses each sensor's own smallest and largest value. On the samples that is about 0.016 µV per step, far finer than the noise of any EEG amplifier. The header range is rounded outwards to fit the format's 8-character fields. The last record is filled up with 0 µV under a `no data` annotation. The start time is the session's start, in UTC, and the patient fields are left as unknown (`X`).
+
+**Api and web.** `GET /sessions/{id}` includes `recording: {status, bytes, seconds}`. `GET /sessions/{id}/recording.edf` streams the file from file storage, with range support; it answers 409 while the file is not written yet. A plain link cannot send a header, so this one path also takes the token as `?token=`, like the WebSocket. After a session ends, the session page asks again every 2 seconds until the file is ready, then shows "Recording EDF" next to the CSV exports. Deleting a session removes its chunks and its file.
+
+Checked on 2026-11-13 with `replayer/check_recording.py`, which reads the file with MNE and compares it with the original sample as the replayer sent it. "Left and right fist", replayed at full speed: 64 of 64 sensor names, 160 Hz, 20,000 of 20,000 samples, every sample within half a step (worst: 0.008 µV on Fpz), 30 of 30 markers on their own sample with label and duration, no missing stretch. The same check passed after `scripts/recorder_crash.ps1` killed the recorder 30 seconds into a real-time replay and kept it down for 26 seconds.
+
+Limits: the chunks are kept until the session is deleted, so a session takes about three times its EDF size in file storage. The file holds what reached the gateway, so samples an amplifier dropped before that are not marked. Only EDF+ is written (no BDF, no BIDS folder yet).
 
 # Not built yet
 

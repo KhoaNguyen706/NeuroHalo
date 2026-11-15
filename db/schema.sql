@@ -1,5 +1,6 @@
 -- Postgres holds sessions, events, 10-second rollups, epochs and summaries.
--- Raw samples are not stored; the recording files remain the source.
+-- Raw samples are not stored here: the recorder writes them to the object
+-- store (table recordings).
 
 CREATE TABLE IF NOT EXISTS sessions (
   id             text PRIMARY KEY,
@@ -8,7 +9,24 @@ CREATE TABLE IF NOT EXISTS sessions (
   channel_names  text[] NOT NULL,
   started_at     timestamptz NOT NULL,
   ended_at       timestamptz,
-  status         text NOT NULL DEFAULT 'live'   -- live | ended
+  status         text NOT NULL DEFAULT 'live',  -- live | ended
+  last_seq       bigint                         -- the last batch stored, set when the stream closes cleanly
+);
+-- For databases created before last_seq existed.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_seq bigint;
+
+-- The raw signal of each session, kept by the recorder. While the session
+-- runs, its batches go to the object store as chunks (spool/<id>/...); once it
+-- has ended they are merged into one EDF+ file (recordings/<id>.edf).
+CREATE TABLE IF NOT EXISTS recordings (
+  session_id text PRIMARY KEY REFERENCES sessions(id),
+  status     text NOT NULL DEFAULT 'recording', -- recording | writing | ready | failed
+  saved_seq  bigint NOT NULL,                   -- the highest batch seq stored in a chunk
+  object_key text NOT NULL DEFAULT '',          -- the EDF file, once ready
+  bytes      bigint NOT NULL DEFAULT 0,         -- its size
+  seconds    double precision NOT NULL DEFAULT 0, -- the signal it holds
+  error      text NOT NULL DEFAULT '',
+  updated_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS events (
