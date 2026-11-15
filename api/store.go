@@ -366,6 +366,11 @@ func (s *store) dropPartitions(_ context.Context, _ *kgo.Client, gone map[string
 // epochs, write idle buckets, commit, repeat. It polls at least once a second so idle
 // buckets are written on time. Kafka rebalances wait until a pass is finished.
 func (s *store) run(ctx context.Context) error {
+	// Every poll blocks rebalances until AllowRebalance. Returning with them
+	// blocked made kafka.Close hang on shutdown until Docker killed the
+	// process, so this consumer never left the group and its successor waited
+	// about 45 seconds (Kafka's session timeout) before storing anything.
+	defer s.kafka.AllowRebalance()
 	for {
 		pollCtx, cancel := context.WithTimeout(ctx, time.Second)
 		fetches := s.kafka.PollFetches(pollCtx)
