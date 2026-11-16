@@ -121,3 +121,28 @@ func TestOverlappingEpochsBothFinish(t *testing.T) {
 		t.Fatalf("got %d epochs, want the ones at samples 800 and 960 in that order", len(epochs))
 	}
 }
+
+// Each sample's value is its own position (plus 10,000 on the second sensor),
+// so the raw stretch must hold exactly the samples from 0.5 s before the
+// marker to 1.3 s after it, sensor by sensor, in order.
+func TestEpochKeepsRawStretch(t *testing.T) {
+	const marker = 803
+	s := newSession("t", testRate, []string{"C3", "C4"}, time.Unix(0, 0), nil)
+	epochs := feedEpochs(s, 12, []uint64{marker}, func(c, n int) float64 {
+		return float64(n + 10000*c)
+	})
+	if len(epochs) != 1 {
+		t.Fatalf("got %d epochs, want 1", len(epochs))
+	}
+	e := epochs[0]
+	if e.VoltagePre != 80 || e.VoltageSamples != 288 || len(e.Voltage) != 288*2 {
+		t.Fatalf("pre %d, samples %d, values %d; want 80, 288, 576", e.VoltagePre, e.VoltageSamples, len(e.Voltage))
+	}
+	for i := 0; i < 288; i++ {
+		for c := 0; c < 2; c++ {
+			if got, want := e.Voltage[i*2+c], float32(marker-80+i+10000*c); got != want {
+				t.Fatalf("sample %d sensor %d = %g, want %g", i, c, got, want)
+			}
+		}
+	}
+}

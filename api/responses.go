@@ -38,6 +38,10 @@ func (s *store) handleEpoch(ctx context.Context, rec *kgo.Record) error {
 		e.PreSteps == 0 || e.PreSteps >= e.Steps {
 		return nil
 	}
+	if len(e.Voltage) != int(e.VoltageSamples)*len(m.names) || e.VoltagePre >= e.VoltageSamples {
+		// The ERP cannot use it; the band power is still fine.
+		e.Voltage, e.VoltageSamples, e.VoltagePre = nil, 0, 0
+	}
 	s.epochs = append(s.epochs, &e)
 	return nil
 }
@@ -54,12 +58,15 @@ func (s *store) writeEpochs(ctx context.Context) error {
 		var batch pgx.Batch
 		for _, e := range s.epochs {
 			batch.Queue(`
-				INSERT INTO epochs (session_id, marker_sample, label, at, steps, pre_steps, step_seconds, window_seconds, band_power, bad)
-				SELECT $1::text, $2::bigint, $3::text, $4::timestamptz, $5::integer, $6::integer, $7::real, $8::real, $9::real[], $10::boolean[]
+				INSERT INTO epochs (session_id, marker_sample, label, at, steps, pre_steps, step_seconds, window_seconds, band_power, bad,
+				                    voltage, voltage_samples, voltage_pre)
+				SELECT $1::text, $2::bigint, $3::text, $4::timestamptz, $5::integer, $6::integer, $7::real, $8::real, $9::real[], $10::boolean[],
+				       $11::real[], $12::integer, $13::integer
 				WHERE EXISTS (SELECT 1 FROM sessions WHERE id = $1) -- skipped when the session was deleted meanwhile
 				ON CONFLICT DO NOTHING`,
 				e.SessionId, int64(e.MarkerSample), e.Label, time.Unix(0, e.TimeUnixNanos),
-				int32(e.Steps), int32(e.PreSteps), e.StepSeconds, e.WindowSeconds, e.BandPower, e.Bad)
+				int32(e.Steps), int32(e.PreSteps), e.StepSeconds, e.WindowSeconds, e.BandPower, e.Bad,
+				nonNil(e.Voltage), int32(e.VoltageSamples), int32(e.VoltagePre))
 		}
 		return s.db.SendBatch(ctx, &batch).Close()
 	})
@@ -68,6 +75,15 @@ func (s *store) writeEpochs(ctx context.Context) error {
 	}
 	s.epochs = s.epochs[:0]
 	return nil
+}
+
+// nonNil turns a missing voltage into an empty array: the column is NOT NULL.
+// Used by: writeEpochs.
+func nonNil(v []float32) []float32 {
+	if v == nil {
+		return []float32{}
+	}
+	return v
 }
 
 // epochRow is one stored epoch, as much of it as averaging needs.

@@ -16,6 +16,7 @@ It is a streaming pipeline first: gRPC in, Kafka in the middle, WebSocket out. R
 - **Flag eye movements and muscle activity:** the two most common kinds of non-brain signal are listed as they start. The rules are simple thresholds, not checked against hand-labelled data.
 - **See the experiment's markers:** when the recording or the live stream says "a cue was shown here", that moment is placed on the exact sample it belongs to, shown on the chart and kept in the event history.
 - **See the averaged response build up:** the signal around every marker is cut out and averaged per label while the session runs, so the response to a cue shows after a handful of trials.
+- **See the ERP:** the voltage after each kind of cue, averaged over its trials: filtered, baselined and with bad trials left out per sensor, the way ERP labs do it. The chart says how many trials each line still has, so you can tell during the session whether you will have enough.
 - **Keep the raw signal:** every session is saved as an EDF+ file, the format EEGLAB, MNE and EDFbrowser open, with the markers inside it. It can be downloaded a few seconds after the session ends, including sessions from a live amplifier.
 - **Organise a study:** put sessions in a study and mark each with who was recorded and what they did. The whole study downloads as a BIDS dataset, the folder layout labs share EEG data in and OpenNeuro accepts, with the markers as an events table and the sensors that failed during recording already marked bad. A session can be filed while it is still recording.
 - **Go back:** an ended session is stored as 10-second averages and events. Move a playhead through it, export CSV, or replay any stretch as a new live session.
@@ -66,12 +67,13 @@ Latency is measured from the moment a batch is sent to the moment its result rea
 
 ## Checked with the tools labs use
 
-The recording and the averaged responses are recomputed from the original file with MNE, the Python library many EEG labs analyse with, and compared number by number, on the "Left and right fist" sample (64 sensors, 125 s, 30 markers). The study download is checked with the official BIDS validator.
+The recording, the averaged responses and the ERPs are recomputed from the original file with MNE, the Python library many EEG labs analyse with, and compared number by number, on the "Left and right fist" sample (64 sensors, 125 s, 30 markers). The study download is checked with the official BIDS validator.
 
 | Output | Check | Result |
 | --- | --- | --- |
 | The recorded EDF+ file | `replayer/check_recording.py`: read with MNE, compared with the file that was replayed | All 20,000 samples of all 64 sensors within 0.008 µV (half a step of the 16-bit scale), all 30 markers on their own sample |
 | The averaged response per marker label | `replayer/check_responses.py`: the same epochs cut and averaged with MNE's Welch spectrum | Same 29 trials and the same sensors left out of each. In all 5 bands, 3 labels, 64 sensors and 21 time steps the power is exactly 4,800 × MNE's µV²/Hz (the Hann window's scale at 160 Hz), within 1.4 × 10⁻⁷. The change from before the marker matches within 0.0001 percentage points |
+| The ERP per marker label | `replayer/check_erp.py`: MNE filters the whole recording with its default 30 Hz low-pass, `mne.Epochs` cuts and baselines the trials, the same rejection is applied | Same 29 trials and the same trials kept per sensor at each threshold (100 µV, 200 µV, none). Every averaged sample of all 64 sensors and 3 labels within 0.00002 µV |
 | A study's BIDS download | The official BIDS validator (3.0.2), then MNE-BIDS reading every recording back | No errors on a study of 4 recordings, 3 participants and 2 tasks, one with 2 runs. MNE-BIDS finds every participant, task and run with all 64 sensors, 160 Hz and every marker. The validator's remaining warnings ask for what only the lab knows: authors and equipment software versions |
 | Bad sensors in the BIDS download | The sample where sensor Cz fails 20 s in, exported and read with MNE-BIDS | Cz is marked bad ("flat from 23 s, 62% of the recording") and MNE puts it in its list of sensors to leave out, with no step by hand |
 

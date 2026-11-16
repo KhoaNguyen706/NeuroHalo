@@ -235,8 +235,14 @@ type Epoch struct {
 	WindowSeconds float32                `protobuf:"fixed32,8,opt,name=window_seconds,json=windowSeconds,proto3" json:"window_seconds,omitempty"`
 	BandPower     []float32              `protobuf:"fixed32,9,rep,packed,name=band_power,json=bandPower,proto3" json:"band_power,omitempty"` // steps x channels x 5 bands, absolute (arbitrary unit)
 	Bad           []bool                 `protobuf:"varint,10,rep,packed,name=bad,proto3" json:"bad,omitempty"`                              // per channel: flat or noisy in any of the windows
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// The raw signal around the marker, for the ERP (the average voltage after
+	// a cue). Sample voltage_pre is the marker's own sample, so the stretch
+	// starts voltage_pre samples before it. Unfiltered, as the batches carried it.
+	Voltage        []float32 `protobuf:"fixed32,11,rep,packed,name=voltage,proto3" json:"voltage,omitempty"` // voltage_samples x channels, row by row, uV
+	VoltageSamples uint32    `protobuf:"varint,12,opt,name=voltage_samples,json=voltageSamples,proto3" json:"voltage_samples,omitempty"`
+	VoltagePre     uint32    `protobuf:"varint,13,opt,name=voltage_pre,json=voltagePre,proto3" json:"voltage_pre,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Epoch) Reset() {
@@ -339,6 +345,27 @@ func (x *Epoch) GetBad() []bool {
 	return nil
 }
 
+func (x *Epoch) GetVoltage() []float32 {
+	if x != nil {
+		return x.Voltage
+	}
+	return nil
+}
+
+func (x *Epoch) GetVoltageSamples() uint32 {
+	if x != nil {
+		return x.VoltageSamples
+	}
+	return 0
+}
+
+func (x *Epoch) GetVoltagePre() uint32 {
+	if x != nil {
+		return x.VoltagePre
+	}
+	return 0
+}
+
 type Event struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
@@ -432,7 +459,7 @@ const file_neuro_v1_features_proto_rawDesc = "" +
 	"\x04Link\x12\f\n" +
 	"\x01a\x18\x01 \x01(\rR\x01a\x12\f\n" +
 	"\x01b\x18\x02 \x01(\rR\x01b\x12\x1a\n" +
-	"\bstrength\x18\x03 \x01(\x02R\bstrength\"\xb7\x02\n" +
+	"\bstrength\x18\x03 \x01(\x02R\bstrength\"\x9b\x03\n" +
 	"\x05Epoch\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x14\n" +
@@ -446,7 +473,11 @@ const file_neuro_v1_features_proto_rawDesc = "" +
 	"\n" +
 	"band_power\x18\t \x03(\x02R\tbandPower\x12\x10\n" +
 	"\x03bad\x18\n" +
-	" \x03(\bR\x03bad\"\x9f\x01\n" +
+	" \x03(\bR\x03bad\x12\x18\n" +
+	"\avoltage\x18\v \x03(\x02R\avoltage\x12'\n" +
+	"\x0fvoltage_samples\x18\f \x01(\rR\x0evoltageSamples\x12\x1f\n" +
+	"\vvoltage_pre\x18\r \x01(\rR\n" +
+	"voltagePre\"\x9f\x01\n" +
 	"\x05Event\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x12\n" +

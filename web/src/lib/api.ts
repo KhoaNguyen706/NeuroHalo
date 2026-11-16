@@ -89,6 +89,23 @@ export type Responses = {
   labels: LabelResponse[];
 };
 
+// The ERP of one marker label: the voltage averaged over its trials.
+// Part of: Erp. Used by: the session page.
+export type LabelErp = {
+  label: string;
+  trials: number; // markers with this label that have a finished trial
+  good: number[]; // per channel: how many of those are in its average (over the threshold or flat: left out)
+  mean: number[]; // samples x channels, row by row: mean voltage in µV after filtering and baseline
+};
+
+// The ERPs of a session. Returned by: api.erp. Used by: the session page.
+export type Erp = {
+  times: number[]; // per sample: seconds after the marker, from -0.2 to 0.8
+  lowpassHz: number; // the low-pass filter applied before averaging
+  reject: number; // µV peak-to-peak above which a trial is left out; 0 keeps all
+  labels: LabelErp[];
+};
+
 // The replay job behind a sample or upload. Returned by: api.replay.
 // Used by: the session page while it waits for the session to start.
 export type Replay = {
@@ -185,6 +202,9 @@ export const api = {
   },
   // responses returns the averaged response to each marker label in one band.
   responses: (id: string, band: Band) => call<Responses>(`/sessions/${enc(id)}/responses?band=${enc(band)}`),
+  // erp returns the ERP of each marker label, leaving out per sensor the
+  // trials over `reject` µV peak-to-peak (0 keeps every trial).
+  erp: (id: string, reject: number) => call<Erp>(`/sessions/${enc(id)}/erp?reject=${reject}`),
   replay: (id: string) => call<Replay>(`/replays/${enc(id)}`),
   // replayFrom queues a new live replay of a session's recording, from `from`
   // seconds into it up to `to` seconds (to the end when `to` is 0).

@@ -3,7 +3,7 @@
 // The session page: the 3D head with a band strength chart under it, and a
 // rail with the data quality, a band selector, toggles for signal correlation,
 // the flat sensor map and (when the session has markers) the averaged
-// response, the event list, the CSV exports and the recording download. While the session is live, frames
+// response and the ERP, the event list, the CSV exports and the recording download. While the session is live, frames
 // stream in over the WebSocket. Once it has ended, the page shows the stored
 // 10-second averages, with a playhead on the chart to move through them.
 
@@ -17,7 +17,7 @@ import SensorMap from "@/components/SensorMap";
 import Timeline, { type Mark, type Series } from "@/components/Timeline";
 import { BASELINE_SECONDS, useBaseline } from "@/hooks/useBaseline";
 import { useLiveSession, type HistoryFrame } from "@/hooks/useLiveSession";
-import { useResponses } from "@/hooks/useResponses";
+import { usePoll } from "@/hooks/usePoll";
 import {
   api, BANDS, QUALITY_NAME, recordingUrl, type Band, type LiveEvent, type LiveFrame, type Rollup, type Session,
 } from "@/lib/api";
@@ -71,6 +71,13 @@ type ChartMode = (typeof CHART_MODES)[number][0];
 
 // The accent at different brightness, so several lines can be told apart
 // without a second hue. The values are per theme, in globals.css.
+// The ERP's rejection choices, in µV peak-to-peak; 0 keeps every trial.
+// The labels are what the chart's header shows.
+const REJECTS: [number, string][] = [[100, "100 µV"], [200, "200 µV"], [0, "Keep all"]];
+// The ERP's sensor when none is highlighted: the top of the head, where
+// most responses to a cue are visible.
+const ERP_DEFAULT = "Cz";
+
 const SHADES = ["var(--shade-1)", "var(--shade-2)", "var(--shade-3)", "var(--shade-4)", "var(--shade-5)"];
 
 // A clicked dot and where to draw its popover, in pixels from the stage's top-left corner.
@@ -142,6 +149,8 @@ function SessionView({ id }: { id: string }) {
   const [map, setMap] = useState(false); // "Sensor map" toggle
   const [raw, setRaw] = useState(false); // "Raw signal" toggle
   const [response, setResponse] = useState(false); // "Averaged response" toggle
+  const [erp, setErp] = useState(false); // "ERP" toggle
+  const [reject, setReject] = useState(REJECTS[0][0]); // the ERP's rejection threshold
   const [chartMode, setChartMode] = useState<ChartMode>("all");
   const [popover, setPopover] = useState<Popover | null>(null);
   const [focus, setFocus] = useState<Focus | null>(null);
@@ -406,7 +415,7 @@ function SessionView({ id }: { id: string }) {
 
   // The averaged response is offered once the session has a marker.
   const hasMarkers = useMemo(() => events.some((e) => e.eventType === "marker"), [events]);
-  const responses = useResponses(id, band, response && hasMarkers, isLive);
+  const responses = usePoll(response && hasMarkers ? band : null, () => api.responses(id, band), isLive);
   // One line per marker label: the band's change at each step, compared with
   // the steps before the marker, for the highlighted sensor or averaged over
   // all sensors. A sensor that was bad in every trial of a label is left out.
@@ -426,6 +435,21 @@ function SessionView({ id }: { id: string }) {
       }))),
     }));
   }, [responses, highlight, names]);
+
+  // The ERP: one line per marker label, in µV, for the highlighted sensor or
+  // Cz. Its count is the trials kept for that sensor, of all the label's trials.
+  const erpData = usePoll(erp && hasMarkers ? String(reject) : null, () => api.erp(id, reject), isLive);
+  const erpChannel = highlight ?? Math.max(0, names.indexOf(ERP_DEFAULT));
+  const erpLines: ResponseLine[] = useMemo(() => {
+    if (!erpData) return [];
+    return erpData.labels.map((l, i) => ({
+      label: l.label,
+      trials: l.good[erpChannel] ?? 0,
+      of: l.trials,
+      shade: SHADES[i % SHADES.length],
+      values: erpData.times.map((_, t) => (l.good[erpChannel] ? l.mean[t * names.length + erpChannel] : NaN)),
+    }));
+  }, [erpData, erpChannel, names]);
 
   const marks: Mark[] = useMemo(
     () => events
@@ -562,6 +586,23 @@ function SessionView({ id }: { id: string }) {
           lines={responseLines}
         />
       )}
+      {erp && hasMarkers && (
+        <ResponseChart
+          title={`ERP · ${names[erpChannel] ?? ""} · ${reject ? `trials over ${reject} µV left out` : "all trials"}`}
+          times={erpData?.times ?? []}
+          lines={erpLines}
+          unit="uV"
+          controls={
+            <div className={styles.modes} role="group" aria-label="Rejection">
+              {REJECTS.map(([value, label]) => (
+                <button key={value} type="button" aria-pressed={reject === value} onClick={() => setReject(value)}>
+                  {label}
+                </button>
+              ))}
+            </div>
+          }
+        />
+      )}
       {raw && isLive && session && (
         <RawTraces rawRef={live.rawRef} frameRef={viewRef} names={names} rate={session.sampleRateHz} />
       )}
@@ -609,6 +650,11 @@ function SessionView({ id }: { id: string }) {
           <button type="button" className={styles.toggle} aria-pressed={response}
             onClick={() => setResponse((on) => !on)}>
             Averaged response
+          </button>
+        )}
+        {hasMarkers && (
+          <button type="button" className={styles.toggle} aria-pressed={erp} onClick={() => setErp((on) => !on)}>
+            ERP
           </button>
         )}
 

@@ -70,7 +70,9 @@ type session struct {
 	// for that window, scratch space for one sensor's window, and the epochs
 	// whose marker has been seen but whose last window is still to come.
 	// epochWin is 0 when the 2-second buffer is too short for them.
+	// voltPre and voltLen place the raw stretch kept for the ERP, in samples.
 	epochWin, epochStep int
+	voltPre, voltLen    int
 	epochAnalyzer       *eeg.Analyzer
 	epochScratch        []float32
 	pending             []*pendingEpoch

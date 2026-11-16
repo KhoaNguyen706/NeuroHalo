@@ -65,8 +65,8 @@ CREATE TABLE IF NOT EXISTS rollups (
 );
 
 -- The signal around each marker, one row per marker ("trial"): band power in
--- short windows from before the marker to after it. Averaged per label by
--- GET /sessions/{id}/responses.
+-- short windows from before the marker to after it, and the raw signal around
+-- it. Averaged per label by GET /sessions/{id}/responses and /erp.
 CREATE TABLE IF NOT EXISTS epochs (
   session_id     text NOT NULL REFERENCES sessions(id),
   marker_sample  bigint NOT NULL,               -- the marker's position in the session
@@ -80,6 +80,11 @@ CREATE TABLE IF NOT EXISTS epochs (
   bad            boolean[] NOT NULL,            -- per channel: flat or noisy somewhere in the epoch
   PRIMARY KEY (session_id, marker_sample)       -- makes a recomputed epoch harmless
 );
+-- The raw signal around the marker, for the ERP (GET /sessions/{id}/erp).
+-- Empty on epochs stored before it existed.
+ALTER TABLE epochs ADD COLUMN IF NOT EXISTS voltage real[] NOT NULL DEFAULT '{}';  -- voltage_samples x channels, uV
+ALTER TABLE epochs ADD COLUMN IF NOT EXISTS voltage_samples integer NOT NULL DEFAULT 0;
+ALTER TABLE epochs ADD COLUMN IF NOT EXISTS voltage_pre integer NOT NULL DEFAULT 0; -- the marker's row in voltage
 
 -- Replays the api asked for (samples and uploads). The replay worker claims
 -- queued rows. session_id has no foreign key: the gateway creates the session

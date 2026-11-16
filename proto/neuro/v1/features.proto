@@ -44,6 +44,12 @@ message Epoch {
   float window_seconds = 8;
   repeated float band_power = 9;          // steps x channels x 5 bands, absolute (arbitrary unit)
   repeated bool bad = 10;                 // per channel: flat or noisy in any of the windows
+  // The raw signal around the marker, for the ERP (the average voltage after
+  // a cue). Sample voltage_pre is the marker's own sample, so the stretch
+  // starts voltage_pre samples before it. Unfiltered, as the batches carried it.
+  repeated float voltage = 11;            // voltage_samples x channels, row by row, uV
+  uint32 voltage_samples = 12;
+  uint32 voltage_pre = 13;
 }
 
 message Event {

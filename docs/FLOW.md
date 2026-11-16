@@ -64,7 +64,7 @@ A session can start three ways, and all three feed the same pipeline: a built-in
 | gateway → `eeg.raw` | the same `SampleBatch`, unchanged | ≈ 4 KB | 10 a second |
 | processor → `eeg.features` | `FeatureFrame`: 64 sensors × 5 bands + 64 quality flags | 320 floats | 2 a second |
 | processor → `eeg.events` | `Event` (`channel_bad`, `channel_recovered`, `alpha_rise`, `eye_movement`, `muscle`, `marker`) | small | only when something happens |
-| processor → `eeg.epochs` | `Epoch`: 21 windows × 64 sensors × 5 bands around one marker | 6,720 floats ≈ 27 KB | one per marker, 4 s after it |
+| processor → `eeg.epochs` | `Epoch`: 21 windows × 64 sensors × 5 bands around one marker, plus 1.8 s of raw signal for the ERP | 25,152 floats ≈ 100 KB | one per marker, 4 s after it |
 | recorder → file storage | one chunk: the session's batches of the last 2 seconds, as they came from Kafka | ≈ 80 KB | one every 2 seconds |
 | recorder → file storage | the EDF+ file: 16 bits per sample | ≈ 20 KB per second of signal | once, after the session ends |
 | api → Postgres | one `rollups` row per 10 seconds, event and epoch rows as they come | | 0.1 rows a second plus events |
@@ -80,7 +80,7 @@ Every Kafka message is **keyed by `session_id`**. Kafka sends all messages with 
 | `studies` | api REST | api REST (study pages, BIDS export) |
 | `events` | api store consumer | api REST |
 | `rollups` | api store consumer | api REST |
-| `epochs` | api store consumer | api REST (`/responses`) |
+| `epochs` | api store consumer | api REST (`/responses`, `/erp`) |
 | `recordings` | recorder (progress after every chunk; the file's state once written) | api REST (session state, download) |
 | `replays` | api (queues a job), replay worker (claims it, records the result) | api REST, the session page while it waits |
 | `summaries` | nobody yet (build step 11) | |
@@ -309,6 +309,7 @@ flowchart TD
 | `GET /sessions/{id}/events` | `listEvents` | `ORDER BY at, id` |
 | `GET /sessions/{id}/rollups?from=&to=` | `listRollups` | `from <= bucket_start < to`, both optional (RFC 3339), plus the band names |
 | `GET /sessions/{id}/responses?band=` | `listResponses` | the session's epochs, averaged per marker label for one band (see "Averaged response") |
+| `GET /sessions/{id}/erp?reject=` | `getERP` | the voltage averaged per marker label, filtered and baselined, trials over `reject` µV left out per sensor (see "ERP") |
 | `GET /sessions/{id}/recording.edf` | `getRecording` | the recorder's EDF+ file (see "Recording") |
 | `PUT /sessions/{id}/study` | `setSessionStudy` | `{studyId, participant, task}` sets all three; `studyId: ""` takes the session out (see "Studies and BIDS") |
 | `GET /studies`, `POST /studies` | `listStudies`, `createStudy` | every study with its session count; a new empty study |
@@ -683,6 +684,41 @@ Measured on 2026-11-12 with the sample "Left and right fist": 29 of 30 markers g
 Limits, for anyone using it as a result: a 1-second window blurs timing to about a second; the bad-sensor rule is the same simple threshold as the live view, so eye blinks reach the frontal sensors' averages; and no statistics are computed.
 
 Checked on 2026-11-14 with `replayer/check_responses.py`, which recomputes every epoch from the original file without NeuroHalo code: MNE reads the file and its annotations, the windows are cut at the same samples, and MNE's `psd_array_welch` (one Hann segment per window) gives the band power. Same file, replayed whole: the same 29 trials, the same sensors left out of each, and in all 5 bands, 3 labels, 64 sensors and 21 steps the averaged power equals MNE's times 4,800 to within 1.4 × 10⁻⁷. That factor is not fitted luck: MNE reports µV²/Hz, and turning a Hann-windowed FFT into that divides by sample rate × Σ window² ÷ 2 = 160 × 60 ÷ 2. The change from before the marker, which is what the page shows, matches within 0.0001 percentage points.
+
+# ERP
+
+The averaged response above follows rhythms, in 1-second windows. The ERP (event-related potential) is the other half of what labs average: the voltage itself, sample by sample, in the second after a cue. A single trial's response is a few microvolts buried in signal ten times larger; the parts not locked to the cue average out over trials, and what is left is the brain's response, with peaks a researcher reads by their timing (for example a dip about 100 ms after a picture, over the back of the head).
+
+```mermaid
+flowchart LR
+    M[marker in a batch] --> S[session.startEpochs]
+    S --> C[session.copyVoltage<br/>1.3 s after the marker]
+    C --> E[[eeg.epochs<br/>same message]]
+    E --> PG[(epochs.voltage)]
+    PG --> R[GET /sessions/id/erp<br/>filter, cut, baseline, reject, average]
+    R -- "every 2 s while live" --> W([ResponseChart, in µV])
+```
+
+**Processor (`processor/epochs.go`).** Each epoch also keeps the raw signal from 0.5 s before to 1.3 s after its marker (288 samples × 64 sensors at 160 Hz). `stepEpochs()` calls `copyVoltage()` when the stretch's last sample arrives; it copies the newest 288 rows out of the 2-second buffer. The stretch rides in the same `Epoch` message (`voltage`, `voltage_samples`, `voltage_pre`), so it is dropped, duplicated and deduplicated exactly like the band power. The processor does no filtering: the stored stretch is what the batches carried.
+
+**Api (`api/erp.go`).** `writeEpochs()` stores the stretch in `epochs.voltage`. `GET /sessions/{id}/erp?reject=100` reads every stretch and, per trial and sensor, `erpTrial()` does the usual ERP steps:
+
+| Step | What | Why |
+| --- | --- | --- |
+| Low-pass at 30 Hz | `lowpassKernel()` builds the filter MNE's `filter_data` designs by default (71 taps at 160 Hz, Hamming-windowed sinc, zero phase), tap for tap | Removes mains hum and muscle noise. Zero phase means the peaks do not move in time |
+| Cut 0.2 s before to 0.8 s after | 161 samples. The stretch's extra 0.3 s on each side covers the filter's reach (35 samples), so the result equals filtering the whole recording first | The usual ERP window |
+| Baseline | Subtract the mean of the 0.2 s before the marker, up to and including it | Every trial starts at 0 µV, so slow drift does not move the average |
+| Reject | Leave the trial out for this sensor if its peak-to-peak is above `reject` µV (100 by default, 0 keeps all) or below 1 µV (flat) | A blink or movement is hundreds of µV and would swamp a few-µV response |
+
+`averageERP()` averages per label and reports, per sensor, how many trials were kept. No high-pass filter is applied: a 0.1 Hz high-pass needs about 30 seconds of signal, and the baseline removes the drift within each 1-second trial. Computing on request, not in the processor, keeps the threshold a choice made while looking at the data, as it is in ERPLAB.
+
+**Web.** "ERP" in the rail, once the session has a marker. The chart shows one line per label for the highlighted sensor, or Cz, in µV from −200 to +800 ms. The header switches the threshold between 100 µV, 200 µV and keeping all trials, and each line's label reads "T1 · 5/8": trials kept for this sensor, of all the label's trials. A label with none kept shows "0/8" and no line.
+
+Checked on 2026-11-15 with `replayer/check_erp.py`, which uses MNE only: it filters the original file with `raw.filter(None, 30)`, cuts the trials with `mne.Epochs(tmin=-0.2, tmax=0.8, baseline=(None, 0))` and applies the same per-sensor rejection. "Left and right fist" replayed whole: the same 29 trials, the same trials kept per sensor at 100 µV, 200 µV and none, and every averaged sample of 64 sensors and 3 labels within 0.00002 µV.
+
+What the check also showed: this sample is far too noisy for the usual 100 µV threshold. After the 30 Hz filter the median trial swings 207 µV peak to peak, and 400 µV over the forehead. At 100 µV Cz keeps no trial at all; at 200 µV it keeps 1 of 8 left-fist trials. The rule is doing its job: these recordings (BCI2000, 2004) were made for movement studies, which look at rhythms, not ERPs. A recording made for ERPs, with a good amplifier and a still participant, keeps most of its trials at 100 µV.
+
+Limits: rejection is per sensor, so different sensors can average different trials (MNE and ERPLAB usually drop the whole trial when any sensor fails; the chart's counts show the difference); the window and the 30 Hz filter are fixed; no statistics are computed yet. The raw stretch grows with sample rate and sensor count, and an `Epoch` must stay under Kafka's 1 MB message limit: about 0.5 MB at 1,000 Hz with 64 sensors, but too close at 2,000 Hz or with 128 sensors at 1,000 Hz.
 
 # Eye movements and muscle activity
 

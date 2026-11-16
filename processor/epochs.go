@@ -20,30 +20,44 @@ const (
 	epochSteps         = epochPreSteps + epochPostSteps
 )
 
+// The epoch also keeps the raw signal around the marker, for the ERP: the
+// voltage averaged over trials. The api shows 0.2 s before to 0.8 s after the
+// marker; the extra 0.3 s on each side lets it filter that stretch exactly
+// as if the whole recording had been filtered (api/erp.go).
+const (
+	voltageBeforeSeconds = 0.5
+	voltageAfterSeconds  = 1.3
+)
+
 // pendingEpoch is one epoch being filled: its marker, how many of its windows
 // are computed, and their results so far.
 // Created by: session.startEpochs.
-// Used by: session.stepEpochs, session.epochStepPower, session.finishEpoch.
+// Used by: session.stepEpochs, session.epochStepPower, session.copyVoltage,
+// session.finishEpoch.
 type pendingEpoch struct {
-	label  string
-	sample uint64    // the marker's position in the session
-	next   int       // windows computed so far
-	power  []float32 // epochSteps x channels x bands
-	bad    []bool    // per channel: flat or noisy in any window so far
+	label   string
+	sample  uint64    // the marker's position in the session
+	next    int       // windows computed so far
+	power   []float32 // epochSteps x channels x bands
+	bad     []bool    // per channel: flat or noisy in any window so far
+	voltage []float32 // voltLen x channels; filled once, voltLen-voltPre-1 samples after the marker
 }
 
-// initEpochs works out the epoch window and step in samples for this
-// session's rate and allocates what computing them needs. Epochs stay off
-// (epochWin 0) when the windows before a marker would not fit in the
-// 2-second buffer, which cannot happen at the constants above.
+// initEpochs works out the epoch window, step and raw stretch in samples for
+// this session's rate and allocates what computing them needs. Epochs stay
+// off (epochWin 0) when the windows before a marker or the raw stretch would
+// not fit in the 2-second buffer, which cannot happen at the constants above.
 // Used by: newSession.
 func (s *session) initEpochs() {
 	win := int(math.Round(epochWindowSeconds * s.rate))
 	step := int(math.Round(epochStepSeconds * s.rate))
-	if step < 1 || win+(epochPreSteps-1)*step > s.win {
+	pre := int(math.Round(voltageBeforeSeconds * s.rate))
+	length := pre + int(math.Round(voltageAfterSeconds*s.rate))
+	if step < 1 || win+(epochPreSteps-1)*step > s.win || length > s.win {
 		return
 	}
 	s.epochWin, s.epochStep = win, step
+	s.voltPre, s.voltLen = pre, length
 	s.epochAnalyzer = eeg.NewAnalyzer(win, s.rate)
 	s.epochScratch = make([]float32, win)
 }
@@ -97,6 +111,9 @@ func (s *session) stepEpochs(sampleIndex uint64) []*neurov1.Epoch {
 		case (sampleIndex-e.sample)%uint64(s.epochStep) == 0:
 			s.epochStepPower(e, 0)
 		}
+		if sampleIndex == e.sample+uint64(s.voltLen-s.voltPre-1) {
+			s.copyVoltage(e)
+		}
 		if e.next == epochSteps {
 			done = append(done, s.finishEpoch(e))
 			continue
@@ -130,21 +147,37 @@ func (s *session) epochStepPower(e *pendingEpoch, back int) {
 	e.next++
 }
 
+// copyVoltage keeps the raw stretch around the epoch's marker: the newest
+// voltLen rows of the buffer, called when the newest row is the stretch's
+// last. The rows are already in the session's row-by-row layout.
+// Used by: stepEpochs.
+func (s *session) copyVoltage(e *pendingEpoch) {
+	e.voltage = make([]float32, s.voltLen*s.channels)
+	first := s.pos - s.voltLen + s.win // s.pos is where the next row will go
+	for i := 0; i < s.voltLen; i++ {
+		row := (first + i) % s.win
+		copy(e.voltage[i*s.channels:(i+1)*s.channels], s.ring[row*s.channels:(row+1)*s.channels])
+	}
+}
+
 // finishEpoch turns a filled epoch into the message for eeg.epochs. Its time
 // is the marker's time on the recording's clock, so an epoch computed twice
 // is exactly equal and Postgres keeps one copy.
 // Used by: stepEpochs.
 func (s *session) finishEpoch(e *pendingEpoch) *neurov1.Epoch {
 	return &neurov1.Epoch{
-		SessionId:     s.id,
-		Label:         e.label,
-		MarkerSample:  e.sample,
-		TimeUnixNanos: s.sampleTime(e.sample).UnixNano(),
-		Steps:         epochSteps,
-		PreSteps:      epochPreSteps,
-		StepSeconds:   float32(s.epochStep) / float32(s.rate),
-		WindowSeconds: float32(s.epochWin) / float32(s.rate),
-		BandPower:     e.power,
-		Bad:           e.bad,
+		SessionId:      s.id,
+		Label:          e.label,
+		MarkerSample:   e.sample,
+		TimeUnixNanos:  s.sampleTime(e.sample).UnixNano(),
+		Steps:          epochSteps,
+		PreSteps:       epochPreSteps,
+		StepSeconds:    float32(s.epochStep) / float32(s.rate),
+		WindowSeconds:  float32(s.epochWin) / float32(s.rate),
+		BandPower:      e.power,
+		Bad:            e.bad,
+		Voltage:        e.voltage,
+		VoltageSamples: uint32(s.voltLen),
+		VoltagePre:     uint32(s.voltPre),
 	}
 }

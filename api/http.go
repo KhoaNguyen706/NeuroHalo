@@ -91,6 +91,7 @@ func (a *api) routes() http.Handler {
 	mux.HandleFunc("GET /sessions/{id}/events", a.listEvents)
 	mux.HandleFunc("GET /sessions/{id}/rollups", a.listRollups)
 	mux.HandleFunc("GET /sessions/{id}/responses", a.listResponses)
+	mux.HandleFunc("GET /sessions/{id}/erp", a.getERP)
 	mux.HandleFunc("GET /sessions/{id}/recording.edf", a.getRecording)
 	mux.HandleFunc("GET /ws/sessions/{id}/live", a.liveSession)
 	mux.HandleFunc("GET /samples", a.listSamples)
