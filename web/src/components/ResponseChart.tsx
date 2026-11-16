@@ -12,12 +12,24 @@ import styles from "./Timeline.module.css";
 
 // One label's line: the value at each time (a change, where 0 is "as before
 // the marker" and -0.5 half as strong, or µV; NaN where unknown), how many
-// trials are in it and, when some were left out, of how many.
+// trials are in it and, when some were left out, of how many. An ERP line
+// also has error bars (the SME around each bin's mean voltage) and a note
+// after its count.
 // Built by: the session page. Used by: ResponseChart.
-export type ResponseLine = { label: string; trials: number; of?: number; values: number[]; shade: string };
+export type ResponseLine = {
+  label: string;
+  trials: number;
+  of?: number;
+  values: number[];
+  shade: string;
+  bars?: { t: number; lo: number; hi: number }[];
+  note?: string;
+};
 
 const HEIGHT = 150;
 const M = { top: 10, right: 80, bottom: 22, left: 48 }; // margins around the plot, in pixels; labels go on the right
+const NOTE_RIGHT = 140; // the right margin when the labels carry a note
+const BAR_SPREAD = 4; // pixels between two lines' error bars at the same time
 const LABEL_GAP = 13; // least distance between two line labels, in pixels
 
 // ResponseChart draws the lines over the times (seconds after the marker), a
@@ -53,7 +65,8 @@ export default function ResponseChart({ title, times, lines, unit = "change", co
   const yMin = uv ? -yMax : -Math.min(1, yMax);
   const t0 = times.length ? times[0] : -1;
   const t1 = times.length ? times[times.length - 1] : 1;
-  const plotW = width - M.left - M.right;
+  const right = lines.some((l) => l.note) ? NOTE_RIGHT : M.right;
+  const plotW = width - M.left - right;
   const plotH = HEIGHT - M.top - M.bottom;
   const x = (t: number) => M.left + ((t - t0) / (t1 - t0)) * plotW;
   const y = (v: number) => M.top + (1 - (Math.min(Math.max(v, yMin), yMax) - yMin) / (yMax - yMin)) * plotH;
@@ -107,7 +120,7 @@ export default function ResponseChart({ title, times, lines, unit = "change", co
         <svg width={width} height={HEIGHT} role="img" aria-label={title}>
           {[yMin, 0, yMax].map((v) => (
             <g key={v}>
-              <line x1={M.left} x2={width - M.right} y1={y(v)} y2={y(v)} className={styles.grid} />
+              <line x1={M.left} x2={width - right} y1={y(v)} y2={y(v)} className={styles.grid} />
               <text x={M.left - 8} y={y(v)} dy="0.32em" textAnchor="end" className={styles.tick}>
                 {valueText(v)}
               </text>
@@ -126,9 +139,20 @@ export default function ResponseChart({ title, times, lines, unit = "change", co
           {lines.map((l) => (
             <path key={l.label} d={pathOf(l.values)} className={styles.series} style={{ stroke: l.shade }} />
           ))}
+          {/* The lines' bars share their times, so each line's sit a few pixels to the side. */}
+          {lines.map((l, i) => l.bars?.map((b) => {
+            const at = x(b.t) + (i - (lines.length - 1) / 2) * BAR_SPREAD;
+            return (
+              <line key={`${l.label}|${b.t}`} x1={at} x2={at} y1={y(b.hi)} y2={y(b.lo)}
+                className={styles.errorBar} style={{ stroke: l.shade }} />
+            );
+          }))}
           {labelRows.map(({ line, at }) => (
-            <text key={line.label} x={width - M.right + 6} y={at} dy="0.32em" className={styles.label}
-              style={{ fill: line.shade }}>{line.label} · {line.trials}{line.of != null && line.of !== line.trials ? `/${line.of}` : ""}</text>
+            <text key={line.label} x={width - right + 6} y={at} dy="0.32em" className={styles.label}
+              style={{ fill: line.shade }}>
+              {line.label} · {line.trials}{line.of != null && line.of !== line.trials ? `/${line.of}` : ""}
+              {line.note ? ` · ${line.note}` : ""}
+            </text>
           ))}
         </svg>
       </div>

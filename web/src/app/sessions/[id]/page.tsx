@@ -19,7 +19,8 @@ import { BASELINE_SECONDS, useBaseline } from "@/hooks/useBaseline";
 import { useLiveSession, type HistoryFrame } from "@/hooks/useLiveSession";
 import { usePoll } from "@/hooks/usePoll";
 import {
-  api, BANDS, QUALITY_NAME, recordingUrl, type Band, type LiveEvent, type LiveFrame, type Rollup, type Session,
+  api, BANDS, QUALITY_NAME, recordingUrl, type Band, type Erp, type LabelErp, type LiveEvent, type LiveFrame, type Rollup,
+  type Session,
 } from "@/lib/api";
 import { exportAverages, exportEvents } from "@/lib/export";
 import { change, clock, parseClock, percent, sessionName } from "@/lib/format";
@@ -118,6 +119,27 @@ function mean(values: number[]): number {
 // meanOf averages power over the listed channels (all channels when the list is null).
 function meanOf(power: number[], channels: number[] | null): number {
   return mean(channels ? channels.map((c) => power[c]) : power);
+}
+
+// erpQuality turns one ERP line's SMEs into error bars at the middle of each
+// 100 ms bin, around the bin's mean voltage, and a note "±12 µV": the root
+// mean square of the SMEs of the bins after the marker. Bins with fewer than
+// 2 trials have no SME and get neither.
+// Used by: SessionView (the ERP lines).
+function erpQuality(erp: Erp, l: LabelErp, c: number, channels: number) {
+  const bars: { t: number; lo: number; hi: number }[] = [];
+  let sum = 0;
+  let n = 0;
+  erp.bins.forEach((start, b) => {
+    const sme = l.sme[b * channels + c];
+    if (!(sme >= 0)) return;
+    const end = erp.bins[b + 1] ?? Infinity;
+    const inBin = erp.times.flatMap((t, i) => (t >= start - 1e-9 && t < end - 1e-9 ? [l.mean[i * channels + c]] : []));
+    const m = mean(inBin);
+    bars.push({ t: start + (erp.bins[1] - erp.bins[0]) / 2, lo: m - sme, hi: m + sme });
+    if (start >= -1e-9) { sum += sme * sme; n++; }
+  });
+  return { bars, note: n ? `±${(Math.sqrt(sum / n)).toFixed(1)} µV` : undefined };
 }
 
 // SessionPage shows the session named in the address. The key makes a move
@@ -437,7 +459,10 @@ function SessionView({ id }: { id: string }) {
   }, [responses, highlight, names]);
 
   // The ERP: one line per marker label, in µV, for the highlighted sensor or
-  // Cz. Its count is the trials kept for that sensor, of all the label's trials.
+  // Cz. Its count is the trials kept for that sensor, of all the label's
+  // trials. Each 100 ms bin gets an error bar of one SME around the bin's
+  // mean voltage, and the note is the SME after the marker in one number:
+  // the root mean square over those bins, as ERPLAB sums SMEs up.
   const erpData = usePoll(erp && hasMarkers ? String(reject) : null, () => api.erp(id, reject), isLive);
   const erpChannel = highlight ?? Math.max(0, names.indexOf(ERP_DEFAULT));
   const erpLines: ResponseLine[] = useMemo(() => {
@@ -448,6 +473,7 @@ function SessionView({ id }: { id: string }) {
       of: l.trials,
       shade: SHADES[i % SHADES.length],
       values: erpData.times.map((_, t) => (l.good[erpChannel] ? l.mean[t * names.length + erpChannel] : NaN)),
+      ...erpQuality(erpData, l, erpChannel, names.length),
     }));
   }, [erpData, erpChannel, names]);
 

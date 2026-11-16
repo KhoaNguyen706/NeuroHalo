@@ -12,6 +12,9 @@ Compared, for every rejection threshold the page offers, label and sensor:
   - which trials count (the processor needs 2 s of signal before a marker and
     4 s after it; a sensor flat or over the threshold is left out per sensor)
   - the averaged voltage at every sample, in uV
+  - the SME of every 100 ms bin (Luck et al. 2021, as ERPLAB computes it by
+    default): the standard deviation of the kept trials' mean voltage in the
+    bin, over the square root of their number
 
     uv run check_erp.py SESSION_ID ../data/S001R03.edf
 
@@ -35,6 +38,7 @@ LOWPASS_HZ = 30.0
 TMIN, TMAX = -0.2, 0.8
 FLAT_UV = 1.0
 REJECTS = [100, 200, 0]
+BIN_SECONDS = 0.1
 
 # The api filters float32 samples in float64 and returns float32 means.
 MAX_UV_ERROR = 1e-3
@@ -94,7 +98,10 @@ def main() -> int:
               f"{name}: {len(got['times'])} samples from {got['times'][0]:+.3f} to {got['times'][-1]:+.3f} s")
         check(sorted(r["label"] for r in got["labels"]) == sorted(set(labels)),
               f"{name}: labels {', '.join(r['label'] for r in got['labels'])}")
-        worst = 0.0
+        worst = worst_sme = 0.0
+        n_bins = round((times[-1] - times[0]) / BIN_SECONDS)
+        bins = np.minimum(np.floor((times - times[0]) / BIN_SECONDS + 1e-9).astype(int), n_bins - 1)
+        check(np.allclose(got["bins"], times[0] + BIN_SECONDS * np.arange(n_bins)), f"{name}: {n_bins} SME bins")
         for r in got["labels"]:
             pick = np.array([lab == r["label"] for lab in labels])
             good = (span[pick] >= FLAT_UV) & ((span[pick] <= reject) if reject else True)  # trials x sensors
@@ -105,7 +112,16 @@ def main() -> int:
             mean = np.divide(total, count[:, None], out=np.zeros_like(total), where=count[:, None] > 0)
             ours = np.array(r["mean"], dtype=np.float64).reshape(len(times), -1).T
             worst = max(worst, float(np.abs(ours - mean).max()))
+
+            # trials x sensors x bins: each trial's mean voltage in each bin
+            bin_means = np.stack([data[pick][..., bins == b].mean(axis=-1) for b in range(n_bins)], axis=-1)
+            sme = np.full((len(count), n_bins), -1.0)
+            for c in np.flatnonzero(count >= 2):
+                sme[c] = bin_means[good[:, c], c].std(axis=0, ddof=1) / np.sqrt(count[c])
+            ours_sme = np.array(r["sme"], dtype=np.float64).reshape(n_bins, -1).T
+            worst_sme = max(worst_sme, float(np.abs(ours_sme - sme).max()))
         check(worst < MAX_UV_ERROR, f"{name}: every averaged sample matches, worst {worst:.1e} uV off")
+        check(worst_sme < MAX_UV_ERROR, f"{name}: every bin's SME matches, worst {worst_sme:.1e} uV off")
 
     print("all checks passed" if not failures else f"{len(failures)} checks failed")
     return 1 if failures else 0

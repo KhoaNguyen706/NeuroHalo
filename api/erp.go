@@ -27,6 +27,14 @@ import (
 //     rejection threshold (a blink, a movement) or below 1 µV (flat).
 // No high-pass filter is applied: the baseline takes the slow drift out
 // within each 1-second trial.
+//
+// Next to the average, it reports how precise the average is: the SME
+// (standardized measurement error, Luck et al. 2021) of the mean voltage in
+// each 100 ms bin, as ERPLAB computes it by default. The SME is the standard
+// error of that bin's mean voltage across the kept trials (their standard
+// deviation over the square root of their number): the smaller it is, the
+// less the average would move with other trials. It falls with more trials
+// and rises with noisier ones, so it is a recording's data quality in µV.
 
 const (
 	erpLowpassHz     = 30.0
@@ -34,6 +42,7 @@ const (
 	erpAfterSeconds  = 0.8
 	erpFlatMicrovolt = 1.0   // peak-to-peak below this: the sensor is flat in that trial
 	erpRejectDefault = 100.0 // µV peak-to-peak; the usual starting point in ERP labs
+	erpBinSeconds    = 0.1   // the SME's time bins, ERPLAB's default
 )
 
 // lowpassKernel designs the low-pass filter MNE's filter_data uses by default
@@ -82,6 +91,8 @@ type erpShape struct {
 	from, to int       // the ERP's rows in the stretch, to inclusive
 	baseline int       // rows from `from` up to and including the marker
 	kernel   []float64 // odd length, symmetric
+	bins     []int     // per ERP sample: its SME bin, from 0
+	numBins  int
 }
 
 // erpTrial filters, cuts and baselines one sensor of one stored trial into
@@ -129,6 +140,9 @@ type erpLabelJSON struct {
 	// samples x channels, row by row: the mean voltage in µV, 0 for a sensor
 	// with no good trial.
 	Mean []float32 `json:"mean"`
+	// bins x channels, row by row: the SME of each bin's mean voltage in µV,
+	// -1 for a sensor with fewer than 2 good trials.
+	SME []float32 `json:"sme"`
 }
 
 // erpJSON is the answer of GET /sessions/{id}/erp.
@@ -137,27 +151,39 @@ type erpJSON struct {
 	Times     []float64      `json:"times"`     // per sample: seconds after the marker
 	LowpassHz float64        `json:"lowpassHz"` // the filter applied first
 	Reject    float64        `json:"reject"`    // µV peak-to-peak; 0 when nothing is rejected
+	Bins      []float64      `json:"bins"`      // per SME bin: its start, in seconds after the marker
 	Labels    []erpLabelJSON `json:"labels"`    // sorted by label
 }
 
 // averageERP turns every trial into its ERP window per sensor and averages
 // them per label, leaving out per sensor the trials that are flat or, when
-// reject is above 0, whose peak-to-peak is above reject. Every row must hold
-// a full stretch of the shape's size.
+// reject is above 0, whose peak-to-peak is above reject. It also gives the
+// SME of every bin from the same kept trials. Every row must hold a full
+// stretch of the shape's size.
 // Used by: getERP.
 func averageERP(rows []voltageRow, sh erpShape, reject float64) []erpLabelJSON {
 	samples := sh.to - sh.from + 1
 	type sums struct {
-		trials int
-		good   []int
-		total  []float64 // samples x channels
+		trials  int
+		good    []int
+		total   []float64 // samples x channels
+		binSum  []float64 // bins x channels: the sum of the trials' bin means
+		binSum2 []float64 // bins x channels: the sum of their squares
 	}
 	byLabel := map[string]*sums{}
 	trial := make([]float64, samples)
+	binMean := make([]float64, sh.numBins)
+	binCount := make([]int, sh.numBins)
+	for i := range trial {
+		binCount[sh.bins[i]]++
+	}
 	for _, row := range rows {
 		a := byLabel[row.label]
 		if a == nil {
-			a = &sums{good: make([]int, sh.channels), total: make([]float64, samples*sh.channels)}
+			a = &sums{
+				good: make([]int, sh.channels), total: make([]float64, samples*sh.channels),
+				binSum: make([]float64, sh.numBins*sh.channels), binSum2: make([]float64, sh.numBins*sh.channels),
+			}
 			byLabel[row.label] = a
 		}
 		a.trials++
@@ -167,23 +193,55 @@ func averageERP(rows []voltageRow, sh erpShape, reject float64) []erpLabelJSON {
 				continue
 			}
 			a.good[c]++
+			clear(binMean)
 			for i, v := range trial {
 				a.total[i*sh.channels+c] += v
+				binMean[sh.bins[i]] += v
+			}
+			for b, v := range binMean {
+				v /= float64(binCount[b])
+				a.binSum[b*sh.channels+c] += v
+				a.binSum2[b*sh.channels+c] += v * v
 			}
 		}
 	}
 	out := []erpLabelJSON{}
 	for label, a := range byLabel {
-		l := erpLabelJSON{Label: label, Trials: a.trials, Good: a.good, Mean: make([]float32, len(a.total))}
+		l := erpLabelJSON{
+			Label: label, Trials: a.trials, Good: a.good,
+			Mean: make([]float32, len(a.total)), SME: make([]float32, len(a.binSum)),
+		}
 		for i, v := range a.total {
 			if n := a.good[i%sh.channels]; n > 0 {
 				l.Mean[i] = float32(v / float64(n))
 			}
 		}
+		for i, sum := range a.binSum {
+			n := float64(a.good[i%sh.channels])
+			if n < 2 {
+				l.SME[i] = -1
+				continue
+			}
+			variance := max(0, (a.binSum2[i]-sum*sum/n)/(n-1)) // sample variance of the trials' bin means
+			l.SME[i] = float32(math.Sqrt(variance / n))
+		}
 		out = append(out, l)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Label < out[j].Label })
 	return out
+}
+
+// binsOf puts each ERP sample time into a 100 ms bin counted from the first
+// time; the last sample (exactly at the window's end) joins the last bin.
+// Returns each sample's bin and the number of bins.
+// Used by: getERP.
+func binsOf(times []float64) ([]int, int) {
+	n := max(1, int(math.Round((times[len(times)-1]-times[0])/erpBinSeconds)))
+	bins := make([]int, len(times))
+	for i, t := range times {
+		bins[i] = min(int(math.Floor((t-times[0])/erpBinSeconds+1e-9)), n-1)
+	}
+	return bins, n
 }
 
 // getERP handles GET /sessions/{id}/erp?reject=100: the ERP of each marker
@@ -213,7 +271,7 @@ func (a *api) getERP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	out := erpJSON{Times: []float64{}, LowpassHz: erpLowpassHz, Reject: reject, Labels: []erpLabelJSON{}}
+	out := erpJSON{Times: []float64{}, LowpassHz: erpLowpassHz, Reject: reject, Bins: []float64{}, Labels: []erpLabelJSON{}}
 	kernel := lowpassKernel(rate, erpLowpassHz)
 	if kernel == nil {
 		writeJSON(w, http.StatusOK, out) // a rate too low for a 30 Hz filter: no ERP
@@ -265,6 +323,10 @@ func (a *api) getERP(w http.ResponseWriter, r *http.Request) {
 	}
 	for row := sh.from; row <= sh.to; row++ {
 		out.Times = append(out.Times, float64(row-sh.pre)/rate)
+	}
+	sh.bins, sh.numBins = binsOf(out.Times)
+	for b := 0; b < sh.numBins; b++ {
+		out.Bins = append(out.Bins, out.Times[0]+float64(b)*erpBinSeconds)
 	}
 	out.Labels = averageERP(trials, sh, reject)
 	writeJSON(w, http.StatusOK, out)

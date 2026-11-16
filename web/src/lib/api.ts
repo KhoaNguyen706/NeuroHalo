@@ -96,6 +96,7 @@ export type LabelErp = {
   trials: number; // markers with this label that have a finished trial
   good: number[]; // per channel: how many of those are in its average (over the threshold or flat: left out)
   mean: number[]; // samples x channels, row by row: mean voltage in µV after filtering and baseline
+  sme: number[]; // bins x channels, row by row: SME of each bin's mean voltage in µV, -1 below 2 trials
 };
 
 // The ERPs of a session. Returned by: api.erp. Used by: the session page.
@@ -103,6 +104,7 @@ export type Erp = {
   times: number[]; // per sample: seconds after the marker, from -0.2 to 0.8
   lowpassHz: number; // the low-pass filter applied before averaging
   reject: number; // µV peak-to-peak above which a trial is left out; 0 keeps all
+  bins: number[]; // per SME bin (100 ms): its start, in seconds after the marker
   labels: LabelErp[];
 };
 
