@@ -6,7 +6,7 @@ NeuroHalo replays EEG recordings (brain activity recorded from sensors on the sc
 
 It is a streaming pipeline first: gRPC in, Kafka in the middle, WebSocket out. Research and education only, not for diagnosis.
 
-![The live session page](docs/img/session.png)
+![NeuroHalo demo: play a sample, watch the bands on the 3D head, see the ERP build up](docs/demo.gif)
 
 ## What it does
 
