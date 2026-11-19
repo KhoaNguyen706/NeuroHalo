@@ -22,8 +22,9 @@ import (
 // starts replays of samples and uploads.
 // Created by: main.
 // Used by: routes, cors, requireToken, listSessions, getSession, listEvents,
-// listRollups, sessionExists (http.go); liveSession (live.go); listSamples,
-// playSample, upload, getReplay, queueReplay (uploads.go).
+// listRollups, sessionExists (http.go); listResponses (responses.go); liveSession (live.go); listSamples,
+// playSample, upload, getReplay, queueReplay (uploads.go); getRecording, removeRecording (recordings.go);
+// listStudies, createStudy, getStudy, deleteStudy, setSessionStudy (studies.go); exportBIDS (bids.go).
 type api struct {
 	db        *pgxpool.Pool
 	token     string
@@ -35,7 +36,7 @@ type api struct {
 
 // sessionJSON is one session as the REST endpoints return it.
 // Filled by: scanSession.
-// Used by: listSessions, getSession.
+// Used by: listSessions, getSession, getStudy (studies.go).
 type sessionJSON struct {
 	ID           string     `json:"id"`
 	Label        string     `json:"label"` // sample title or uploaded file name; empty for hand-run replays
@@ -45,6 +46,13 @@ type sessionJSON struct {
 	StartedAt    time.Time  `json:"startedAt"`
 	EndedAt      *time.Time `json:"endedAt"`
 	Status       string     `json:"status"`
+	// The recorder's file of the raw signal; nil before its first chunk is stored.
+	Recording *recordingJSON `json:"recording"`
+	// The study the session belongs to ("" for none), and inside it who was
+	// recorded and what they did. Set by PUT /sessions/{id}/study.
+	StudyID     string `json:"studyId"`
+	Participant string `json:"participant"`
+	Task        string `json:"task"`
 }
 
 // eventJSON is one stored event.
@@ -65,10 +73,13 @@ type rollupJSON struct {
 	Frames      int       `json:"frames"`
 }
 
-// sessionSelect reads sessions with the label of the replay that started them.
+// sessionSelect reads sessions with the label of the replay that started them,
+// the state of their recording and their study tags.
 const sessionSelect = `SELECT s.id, COALESCE(r.label, ''), s.source, s.sample_rate_hz, s.channel_names,
-	s.started_at, s.ended_at, s.status
-	FROM sessions s LEFT JOIN replays r ON r.session_id = s.id`
+	s.started_at, s.ended_at, s.status, rec.status, rec.bytes, rec.seconds,
+	COALESCE(s.study_id, ''), s.participant, s.task
+	FROM sessions s LEFT JOIN replays r ON r.session_id = s.id
+	LEFT JOIN recordings rec ON rec.session_id = s.id`
 
 // routes returns the HTTP handler: CORS outside, then the bearer token, then
 // the endpoints.
@@ -79,12 +90,21 @@ func (a *api) routes() http.Handler {
 	mux.HandleFunc("DELETE /sessions/{id}", a.deleteSession)
 	mux.HandleFunc("GET /sessions/{id}/events", a.listEvents)
 	mux.HandleFunc("GET /sessions/{id}/rollups", a.listRollups)
+	mux.HandleFunc("GET /sessions/{id}/responses", a.listResponses)
+	mux.HandleFunc("GET /sessions/{id}/erp", a.getERP)
+	mux.HandleFunc("GET /sessions/{id}/recording.edf", a.getRecording)
 	mux.HandleFunc("GET /ws/sessions/{id}/live", a.liveSession)
 	mux.HandleFunc("GET /samples", a.listSamples)
 	mux.HandleFunc("POST /samples/{name}/play", a.playSample)
 	mux.HandleFunc("POST /uploads", a.upload)
 	mux.HandleFunc("GET /replays/{id}", a.getReplay)
 	mux.HandleFunc("POST /sessions/{id}/replay", a.replayFrom)
+	mux.HandleFunc("PUT /sessions/{id}/study", a.setSessionStudy)
+	mux.HandleFunc("GET /studies", a.listStudies)
+	mux.HandleFunc("POST /studies", a.createStudy)
+	mux.HandleFunc("GET /studies/{id}", a.getStudy)
+	mux.HandleFunc("DELETE /studies/{id}", a.deleteStudy)
+	mux.HandleFunc("GET /studies/{id}/bids.zip", a.exportBIDS)
 	return a.cors(a.requireToken(mux))
 }
 
@@ -97,7 +117,7 @@ func (a *api) cors(next http.Handler) http.Handler {
 			if origin == o {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE")
 				w.Header().Set("Access-Control-Max-Age", "600")
 				w.Header().Add("Vary", "Origin")
 				break
@@ -112,12 +132,12 @@ func (a *api) cors(next http.Handler) http.Handler {
 }
 
 // requireToken rejects a request without "Authorization: Bearer <token>".
-// Browsers cannot set headers on a WebSocket, so /ws/ paths may pass the
-// token as ?token= instead.
+// Browsers cannot set headers on a WebSocket or on a plain download link, so
+// /ws/ paths and file downloads (.edf, .zip) may pass the token as ?token= instead.
 func (a *api) requireToken(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !ok && strings.HasPrefix(r.URL.Path, "/ws/") {
+		if !ok && (strings.HasPrefix(r.URL.Path, "/ws/") || isDownload(r.URL.Path)) {
 			got, ok = r.URL.Query().Get("token"), true
 		}
 		if !ok || subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) != 1 {
@@ -126,6 +146,13 @@ func (a *api) requireToken(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isDownload reports whether a path is a file a browser fetches with a plain
+// link: a session's EDF file or a study's BIDS zip.
+// Used by: api.requireToken.
+func isDownload(path string) bool {
+	return strings.HasSuffix(path, "/recording.edf") || strings.HasSuffix(path, "/bids.zip")
 }
 
 // writeJSON sends v as a JSON response with the given status.
@@ -151,7 +178,14 @@ func serverError(w http.ResponseWriter, r *http.Request, err error) {
 // scanSession reads one row selected with sessionSelect.
 func scanSession(row pgx.Row) (sessionJSON, error) {
 	var s sessionJSON
-	err := row.Scan(&s.ID, &s.Label, &s.Source, &s.SampleRateHz, &s.ChannelNames, &s.StartedAt, &s.EndedAt, &s.Status)
+	var recStatus *string
+	var recBytes *int64
+	var recSeconds *float64
+	err := row.Scan(&s.ID, &s.Label, &s.Source, &s.SampleRateHz, &s.ChannelNames, &s.StartedAt, &s.EndedAt, &s.Status,
+		&recStatus, &recBytes, &recSeconds, &s.StudyID, &s.Participant, &s.Task)
+	if err == nil && recStatus != nil {
+		s.Recording = &recordingJSON{Status: *recStatus, Bytes: *recBytes, Seconds: *recSeconds}
+	}
 	return s, err
 }
 
@@ -209,10 +243,10 @@ func (a *api) getSession(w http.ResponseWriter, r *http.Request) {
 }
 
 // deleteSession handles DELETE /sessions/{id}: removes an ended session with
-// its events, rollups, summary and replay job, all in one transaction. A
-// live session is refused (409): its stream is still writing. When the
-// session came from an upload that no other session uses, the stored file is
-// removed too.
+// its events, rollups, epochs, summary, replay job and recording, all in one
+// transaction. A live session is refused (409): its stream is still writing.
+// The recording's files are removed after the commit, and so is the uploaded
+// file behind the session when no other session uses it.
 func (a *api) deleteSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	ctx := r.Context()
@@ -252,8 +286,10 @@ func (a *api) deleteSession(w http.ResponseWriter, r *http.Request) {
 	for _, q := range []string{
 		`DELETE FROM events WHERE session_id = $1`,
 		`DELETE FROM rollups WHERE session_id = $1`,
+		`DELETE FROM epochs WHERE session_id = $1`,
 		`DELETE FROM summaries WHERE session_id = $1`,
 		`DELETE FROM replays WHERE session_id = $1`,
+		`DELETE FROM recordings WHERE session_id = $1`,
 		`DELETE FROM sessions WHERE id = $1`,
 	} {
 		if _, err := tx.Exec(ctx, q, id); err != nil {
@@ -266,10 +302,13 @@ func (a *api) deleteSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The rows are gone; a file left behind only wastes space, so a failure here is logged, not returned.
-	if orphan != "" && a.objects != nil {
-		if err := a.objects.client.RemoveObject(ctx, a.objects.bucket, orphan, minio.RemoveObjectOptions{}); err != nil {
-			log.Printf("delete session %s: cannot remove %s: %v", id, orphan, err)
+	if a.objects != nil {
+		if orphan != "" {
+			if err := a.objects.client.RemoveObject(ctx, a.objects.bucket, orphan, minio.RemoveObjectOptions{}); err != nil {
+				log.Printf("delete session %s: cannot remove %s: %v", id, orphan, err)
+			}
 		}
+		a.removeRecording(ctx, id)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
 }

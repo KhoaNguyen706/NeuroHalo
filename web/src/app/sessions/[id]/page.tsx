@@ -1,8 +1,9 @@
 "use client";
 
 // The session page: the 3D head with a band strength chart under it, and a
-// rail with the data quality, a band selector, toggles for signal correlation
-// and the flat sensor map, the event list and the CSV exports. While the session is live, frames
+// rail with the data quality, a band selector, toggles for signal correlation,
+// the flat sensor map and (when the session has markers) the averaged
+// response and the ERP, the event list, the CSV exports and the recording download. While the session is live, frames
 // stream in over the WebSocket. Once it has ended, the page shows the stored
 // 10-second averages, with a playhead on the chart to move through them.
 
@@ -11,12 +12,15 @@ import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DotPick } from "@/components/HeadScene";
 import RawTraces from "@/components/RawTraces";
+import ResponseChart, { type ResponseLine } from "@/components/ResponseChart";
 import SensorMap from "@/components/SensorMap";
 import Timeline, { type Mark, type Series } from "@/components/Timeline";
 import { BASELINE_SECONDS, useBaseline } from "@/hooks/useBaseline";
 import { useLiveSession, type HistoryFrame } from "@/hooks/useLiveSession";
+import { usePoll } from "@/hooks/usePoll";
 import {
-  api, BANDS, QUALITY_NAME, type Band, type LiveEvent, type LiveFrame, type Rollup, type Session,
+  api, BANDS, QUALITY_NAME, recordingUrl, type Band, type Erp, type LabelErp, type LiveEvent, type LiveFrame, type Rollup,
+  type Session,
 } from "@/lib/api";
 import { exportAverages, exportEvents } from "@/lib/export";
 import { change, clock, parseClock, percent, sessionName } from "@/lib/format";
@@ -28,6 +32,8 @@ const HeadScene = dynamic(() => import("@/components/HeadScene"), { ssr: false }
 
 const NO_NAMES: string[] = []; // one shared empty list, so HeadScene's props stay the same between renders
 const SESSION_POLL_MS = 1000;
+const RECORDING_POLL_MS = 2000;
+const RECORDING_FIRST_CHUNK_MS = 20_000; // how long after the end a recording may still be missing
 const HISTORY_SETTLE_MS = 20_000; // how long after a session ends its stored averages may still change
 const HISTORY_POLL_MS = 2000;
 const STALE_AFTER_MS = 5000; // no frame for this long: check whether the session has ended
@@ -52,10 +58,12 @@ const EVENT_WORD: Record<string, string> = {
 
 // Events that get a tick on the chart. Eye movements and muscle activity are
 // listed in the rail only: there are several a minute, too many for ticks.
+// A marker is what the experiment itself reported (a cue, a task starting).
 const MARK_KIND: Record<string, Mark["kind"]> = {
   channel_bad: "bad",
   channel_recovered: "recovered",
   alpha_rise: "rise",
+  marker: "marker",
 };
 
 // What the chart draws: one line, one line per brain region, or left and right.
@@ -64,6 +72,13 @@ type ChartMode = (typeof CHART_MODES)[number][0];
 
 // The accent at different brightness, so several lines can be told apart
 // without a second hue. The values are per theme, in globals.css.
+// The ERP's rejection choices, in µV peak-to-peak; 0 keeps every trial.
+// The labels are what the chart's header shows.
+const REJECTS: [number, string][] = [[100, "100 µV"], [200, "200 µV"], [0, "Keep all"]];
+// The ERP's sensor when none is highlighted: the top of the head, where
+// most responses to a cue are visible.
+const ERP_DEFAULT = "Cz";
+
 const SHADES = ["var(--shade-1)", "var(--shade-2)", "var(--shade-3)", "var(--shade-4)", "var(--shade-5)"];
 
 // A clicked dot and where to draw its popover, in pixels from the stage's top-left corner.
@@ -75,15 +90,22 @@ type Popover = { channel: number; left: number; top: number };
 // Set by: the event list. Used by: SessionPage (chart, highlight).
 type Focus = { key: string; channel: number | null };
 
+// markerLabel is the label the experiment gave a marker event, "" for other events.
+function markerLabel(event: LiveEvent): string {
+  return event.eventType === "marker" && typeof event.details.label === "string" ? event.details.label : "";
+}
+
 // eventText is an event in 1 to 3 words: "Cz bad", "PO8 recovered", "Alpha rise".
+// A marker is shown by its own label, as the experiment wrote it: "T1".
 function eventText(event: LiveEvent): string {
+  if (event.eventType === "marker") return markerLabel(event) || "Marker";
   const word = EVENT_WORD[event.eventType] ?? event.eventType;
   return event.channel ? `${event.channel} ${word}` : word;
 }
 
 // eventKey identifies one event in the list and on the chart.
 function eventKey(event: LiveEvent): string {
-  return `${event.eventType}|${event.channel}|${event.atMs}`;
+  return `${event.eventType}|${event.channel}|${event.atMs}|${markerLabel(event)}`;
 }
 
 // mean of the finite numbers, NaN when there are none.
@@ -97,6 +119,27 @@ function mean(values: number[]): number {
 // meanOf averages power over the listed channels (all channels when the list is null).
 function meanOf(power: number[], channels: number[] | null): number {
   return mean(channels ? channels.map((c) => power[c]) : power);
+}
+
+// erpQuality turns one ERP line's SMEs into error bars at the middle of each
+// 100 ms bin, around the bin's mean voltage, and a note "±12 µV": the root
+// mean square of the SMEs of the bins after the marker. Bins with fewer than
+// 2 trials have no SME and get neither.
+// Used by: SessionView (the ERP lines).
+function erpQuality(erp: Erp, l: LabelErp, c: number, channels: number) {
+  const bars: { t: number; lo: number; hi: number }[] = [];
+  let sum = 0;
+  let n = 0;
+  erp.bins.forEach((start, b) => {
+    const sme = l.sme[b * channels + c];
+    if (!(sme >= 0)) return;
+    const end = erp.bins[b + 1] ?? Infinity;
+    const inBin = erp.times.flatMap((t, i) => (t >= start - 1e-9 && t < end - 1e-9 ? [l.mean[i * channels + c]] : []));
+    const m = mean(inBin);
+    bars.push({ t: start + (erp.bins[1] - erp.bins[0]) / 2, lo: m - sme, hi: m + sme });
+    if (start >= -1e-9) { sum += sme * sme; n++; }
+  });
+  return { bars, note: n ? `±${(Math.sqrt(sum / n)).toFixed(1)} µV` : undefined };
 }
 
 // SessionPage shows the session named in the address. The key makes a move
@@ -127,6 +170,9 @@ function SessionView({ id }: { id: string }) {
   const [links, setLinks] = useState(false); // "Signal correlation" toggle
   const [map, setMap] = useState(false); // "Sensor map" toggle
   const [raw, setRaw] = useState(false); // "Raw signal" toggle
+  const [response, setResponse] = useState(false); // "Averaged response" toggle
+  const [erp, setErp] = useState(false); // "ERP" toggle
+  const [reject, setReject] = useState(REJECTS[0][0]); // the ERP's rejection threshold
   const [chartMode, setChartMode] = useState<ChartMode>("all");
   const [popover, setPopover] = useState<Popover | null>(null);
   const [focus, setFocus] = useState<Focus | null>(null);
@@ -193,6 +239,19 @@ function SessionView({ id }: { id: string }) {
     }, STALE_AFTER_MS);
     return () => clearTimeout(timer);
   }, [isLive, id, live.elapsedSeconds, live.status]);
+
+  // The recording is written a few seconds after the session ends: ask again
+  // until it is ready or has failed. A session with no recording a while after
+  // its end has none (its source is not recorded).
+  const recordingStatus = session?.recording?.status ?? null;
+  useEffect(() => {
+    if (!ended || recordingStatus === "ready" || recordingStatus === "failed") return;
+    if (recordingStatus === null && Date.now() > Date.parse(session?.endedAt ?? "") + RECORDING_FIRST_CHUNK_MS) return;
+    const timer = setTimeout(() => {
+      api.session(id).then(setSession).catch(() => {});
+    }, RECORDING_POLL_MS);
+    return () => clearTimeout(timer);
+  }, [ended, recordingStatus, session, id]);
 
   // Stored events: once when the session is found, and again when it ends.
   // They cover what happened before this page was opened.
@@ -376,6 +435,48 @@ function SessionView({ id }: { id: string }) {
     chartTitle = `${bandName} · by region`;
   }
 
+  // The averaged response is offered once the session has a marker.
+  const hasMarkers = useMemo(() => events.some((e) => e.eventType === "marker"), [events]);
+  const responses = usePoll(response && hasMarkers ? band : null, () => api.responses(id, band), isLive);
+  // One line per marker label: the band's change at each step, compared with
+  // the steps before the marker, for the highlighted sensor or averaged over
+  // all sensors. A sensor that was bad in every trial of a label is left out.
+  const responseLines: ResponseLine[] = useMemo(() => {
+    if (!responses) return [];
+    const channels = highlight != null ? [highlight] : names.map((_, c) => c);
+    return responses.labels.map((l, i) => ({
+      label: l.label,
+      trials: l.trials,
+      shade: SHADES[i % SHADES.length],
+      values: responses.times.map((_, step) => mean(channels.map((c) => {
+        if (!l.good[c]) return NaN;
+        let before = 0;
+        for (let s = 0; s < responses.preSteps; s++) before += l.power[s * names.length + c];
+        before /= responses.preSteps;
+        return before > 0 ? l.power[step * names.length + c] / before - 1 : NaN;
+      }))),
+    }));
+  }, [responses, highlight, names]);
+
+  // The ERP: one line per marker label, in µV, for the highlighted sensor or
+  // Cz. Its count is the trials kept for that sensor, of all the label's
+  // trials. Each 100 ms bin gets an error bar of one SME around the bin's
+  // mean voltage, and the note is the SME after the marker in one number:
+  // the root mean square over those bins, as ERPLAB sums SMEs up.
+  const erpData = usePoll(erp && hasMarkers ? String(reject) : null, () => api.erp(id, reject), isLive);
+  const erpChannel = highlight ?? Math.max(0, names.indexOf(ERP_DEFAULT));
+  const erpLines: ResponseLine[] = useMemo(() => {
+    if (!erpData) return [];
+    return erpData.labels.map((l, i) => ({
+      label: l.label,
+      trials: l.good[erpChannel] ?? 0,
+      of: l.trials,
+      shade: SHADES[i % SHADES.length],
+      values: erpData.times.map((_, t) => (l.good[erpChannel] ? l.mean[t * names.length + erpChannel] : NaN)),
+      ...erpQuality(erpData, l, erpChannel, names.length),
+    }));
+  }, [erpData, erpChannel, names]);
+
   const marks: Mark[] = useMemo(
     () => events
       .filter((e) => MARK_KIND[e.eventType])
@@ -504,6 +605,30 @@ function SessionView({ id }: { id: string }) {
         range={rangeT}
         onPick={ended ? pickTime : undefined}
       />
+      {response && hasMarkers && (
+        <ResponseChart
+          title={`${bandName} · ${highlight != null ? names[highlight] : "average of all sensors"} · change after the marker`}
+          times={responses?.times ?? []}
+          lines={responseLines}
+        />
+      )}
+      {erp && hasMarkers && (
+        <ResponseChart
+          title={`ERP · ${names[erpChannel] ?? ""} · ${reject ? `trials over ${reject} µV left out` : "all trials"}`}
+          times={erpData?.times ?? []}
+          lines={erpLines}
+          unit="uV"
+          controls={
+            <div className={styles.modes} role="group" aria-label="Rejection">
+              {REJECTS.map(([value, label]) => (
+                <button key={value} type="button" aria-pressed={reject === value} onClick={() => setReject(value)}>
+                  {label}
+                </button>
+              ))}
+            </div>
+          }
+        />
+      )}
       {raw && isLive && session && (
         <RawTraces rawRef={live.rawRef} frameRef={viewRef} names={names} rate={session.sampleRateHz} />
       )}
@@ -536,7 +661,7 @@ function SessionView({ id }: { id: string }) {
           Signal correlation
         </button>
 
-        {/* Raw samples are not stored, so the raw signal exists only while a session is live. To see it for a past moment, replay that stretch. */}
+        {/* The raw signal is drawn from the live stream only. An ended session's raw signal is in its EDF download. */}
         <button type="button" className={styles.toggle} aria-pressed={raw && isLive} disabled={ended}
           onClick={() => setRaw((on) => !on)}>
           Raw signal
@@ -545,6 +670,19 @@ function SessionView({ id }: { id: string }) {
         <button type="button" className={styles.toggle} aria-pressed={map} onClick={() => setMap((on) => !on)}>
           Sensor map
         </button>
+
+        {/* Each line is the average over the trials of one marker label, so it only exists for a session with markers. */}
+        {hasMarkers && (
+          <button type="button" className={styles.toggle} aria-pressed={response}
+            onClick={() => setResponse((on) => !on)}>
+            Averaged response
+          </button>
+        )}
+        {hasMarkers && (
+          <button type="button" className={styles.toggle} aria-pressed={erp} onClick={() => setErp((on) => !on)}>
+            ERP
+          </button>
+        )}
 
         {/* Only a session with a stored recording behind it can be replayed. */}
         {ended && offset != null && (
@@ -590,6 +728,7 @@ function SessionView({ id }: { id: string }) {
           <div className={styles.exports}>
             <button type="button" onClick={() => exportAverages(session).catch(() => {})}>Averages CSV</button>
             <button type="button" onClick={() => exportEvents(session).catch(() => {})}>Events CSV</button>
+            {session.recording?.status === "ready" && <a href={recordingUrl(session.id)}>Recording EDF</a>}
           </div>
         )}
       </aside>

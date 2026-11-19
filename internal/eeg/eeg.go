@@ -64,7 +64,8 @@ func BackOfHead(channel string) bool {
 // Analyzer computes band power for windows of one fixed length and sample rate.
 // It is not safe for use from several goroutines.
 // Created by: NewAnalyzer (called from the processor's newSession).
-// Used by: Analyze (its method), called from the processor's session.compute.
+// Used by: Analyze and Power (its methods), called from the processor's
+// session.compute and session.epochStep.
 type Analyzer struct {
 	fft     *fourier.FFT
 	hann    []float64
@@ -105,6 +106,33 @@ func NewAnalyzer(windowSamples int, sampleRateHz float64) *Analyzer {
 // strength of each band (0 to 1, summing to 1) into out and returns the quality.
 // A sensor with no power between 1 and 45 Hz gets all zeros.
 func (a *Analyzer) Analyze(window []float32, out []float32) neurov1.Quality {
+	power, total, quality := a.spectrum(window)
+	for i := range power {
+		if total > 0 {
+			out[i] = float32(power[i] / total)
+		} else {
+			out[i] = 0
+		}
+	}
+	return quality
+}
+
+// Power takes one sensor's window in microvolts. It writes the power of each
+// band into out, not divided by the total, and returns the quality. The unit
+// is arbitrary (it depends on the window length), so the numbers are only
+// meaningful compared with other windows of the same length: "alpha fell to
+// half of what it was before the cue".
+func (a *Analyzer) Power(window []float32, out []float32) neurov1.Quality {
+	power, _, quality := a.spectrum(window)
+	for i := range power {
+		out[i] = float32(power[i])
+	}
+	return quality
+}
+
+// spectrum does the work shared by Analyze and Power: the power in each band,
+// their total, and the window's quality.
+func (a *Analyzer) spectrum(window []float32) (power [NumBands]float64, total float64, quality neurov1.Quality) {
 	lo, hi := float64(window[0]), float64(window[0])
 	var sum float64
 	for _, v := range window {
@@ -122,8 +150,6 @@ func (a *Analyzer) Analyze(window []float32, out []float32) neurov1.Quality {
 	std := math.Sqrt(variance / float64(len(window)))
 
 	a.fft.Coefficients(a.coef, a.in)
-	var power [NumBands]float64
-	var total float64
 	for k, c := range a.coef {
 		if b := a.binBand[k]; b >= 0 {
 			p := real(c)*real(c) + imag(c)*imag(c)
@@ -131,19 +157,13 @@ func (a *Analyzer) Analyze(window []float32, out []float32) neurov1.Quality {
 			total += p
 		}
 	}
-	for i := range power {
-		if total > 0 {
-			out[i] = float32(power[i] / total)
-		} else {
-			out[i] = 0
-		}
-	}
-
 	switch {
 	case std < FlatStdMicrovolts:
-		return neurov1.Quality_QUALITY_FLAT
+		quality = neurov1.Quality_QUALITY_FLAT
 	case hi-lo > NoisyPeakToPeakMicrovolt:
-		return neurov1.Quality_QUALITY_NOISY
+		quality = neurov1.Quality_QUALITY_NOISY
+	default:
+		quality = neurov1.Quality_QUALITY_OK
 	}
-	return neurov1.Quality_QUALITY_OK
+	return power, total, quality
 }

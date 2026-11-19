@@ -71,3 +71,4 @@ spec:
               $T --topic eeg.raw      --partitions 12 --config retention.bytes=1073741824
               $T --topic eeg.features --partitions 12 --config retention.ms=86400000
               $T --topic eeg.events   --partitions 3  --config retention.ms=604800000
+              $T --topic eeg.epochs   --partitions 3  --config retention.ms=604800000

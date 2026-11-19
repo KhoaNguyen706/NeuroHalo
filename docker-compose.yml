@@ -24,7 +24,7 @@ services:
       timeout: 10s
       retries: 20
 
-  # Creates the three topics, then exits.
+  # Creates the four topics, then exits.
   kafka-init:
     image: apache/kafka:4.0.0
     depends_on:
@@ -38,6 +38,7 @@ services:
         $$T --topic eeg.raw      --partitions 12 --config retention.bytes=1073741824
         $$T --topic eeg.features --partitions 12 --config retention.ms=86400000
         $$T --topic eeg.events   --partitions 3  --config retention.ms=604800000
+        $$T --topic eeg.epochs   --partitions 3  --config retention.ms=604800000
 
   postgres:
     image: postgres:17
@@ -56,6 +57,21 @@ services:
       timeout: 3s
       retries: 20
 
+  # Applies db/schema.sql, then exits. Postgres itself only runs the file on a
+  # brand-new data volume; this runs it on every start, so a database made
+  # before a table was added gets that table. Every statement in the file is
+  # safe to repeat.
+  postgres-init:
+    image: postgres:17
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: neuro
+    volumes:
+      - ./db/schema.sql:/schema.sql:ro
+    entrypoint: ["psql", "-h", "postgres", "-U", "neuro", "-d", "neuro", "-q", "-v", "ON_ERROR_STOP=1", "-f", "/schema.sql"]
+
   gateway:
     build:
       context: .
@@ -71,8 +87,8 @@ services:
     depends_on: &backends
       kafka-init:
         condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
 
   processor:
     build:
@@ -111,7 +127,28 @@ services:
     restart: unless-stopped
     depends_on: *backends
 
-  # S3-compatible file storage for uploads (SeaweedFS; S3 on AWS).
+  # Keeps the raw signal of every session: reads eeg.raw as its own consumer
+  # group and writes one EDF+ file per session to the object store.
+  recorder:
+    build:
+      context: .
+      dockerfile: go.Dockerfile
+      args:
+        SERVICE: recorder
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      DATABASE_URL: postgres://neuro:neuro@postgres:5432/neuro
+      S3_ENDPOINT: storage:8333
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-neuro}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-neuro-dev-secret}
+      S3_BUCKET: recordings
+    restart: unless-stopped
+    depends_on:
+      <<: *backends
+      storage:
+        condition: service_started
+
+  # S3-compatible file storage for uploads and recordings (SeaweedFS; S3 on AWS).
   storage:
     image: chrislusf/seaweedfs:4.53
     environment:

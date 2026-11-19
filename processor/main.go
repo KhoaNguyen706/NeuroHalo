@@ -50,6 +50,7 @@ const (
 	rawTopic      = "eeg.raw"
 	featuresTopic = "eeg.features"
 	eventsTopic   = "eeg.events"
+	epochsTopic   = "eeg.epochs"
 	group         = "processor"
 
 	sessionTimeout = 10 * time.Second
@@ -69,7 +70,7 @@ type processor struct {
 
 	produceErr atomic.Pointer[error]
 
-	batches, frames, events, duplicates, missing, unknown uint64
+	batches, frames, events, epochs, duplicates, missing, unknown uint64
 }
 
 // loadSession reads the details the gateway saved when the header arrived.
@@ -120,8 +121,8 @@ func (p *processor) send(topic, key string, msg proto.Message) {
 }
 
 // handle processes one record from eeg.raw: decode the batch, find or load
-// its session, feed the samples in, and queue the frames and events that
-// come out. It returns an error only when the processor has to stop.
+// its session, feed the samples in, and queue the frames, events and epochs
+// that come out. It returns an error only when the processor has to stop.
 func (p *processor) handle(ctx context.Context, rec *kgo.Record) error {
 	var batch neurov1.SampleBatch
 	if err := proto.Unmarshal(rec.Value, &batch); err != nil {
@@ -164,6 +165,10 @@ func (p *processor) handle(ctx context.Context, rec *kgo.Record) error {
 		p.send(eventsTopic, s.id, e)
 		log.Printf("session %s: event %s %s %s", s.id, e.Type, e.Channel, e.DetailsJson)
 	}
+	for _, e := range res.epochs {
+		p.send(epochsTopic, s.id, e)
+	}
+	p.epochs += uint64(len(res.epochs))
 	p.frames += uint64(len(res.frames))
 	p.events += uint64(len(res.events))
 	return nil
@@ -209,8 +214,8 @@ func (p *processor) run(ctx context.Context) error {
 		now := time.Now()
 		if now.Sub(lastStats) >= statsEvery {
 			if p.batches != lastBatches {
-				log.Printf("batches=%d frames=%d events=%d duplicates=%d missing=%d skipped=%d sessions=%d",
-					p.batches, p.frames, p.events, p.duplicates, p.missing, p.unknown, len(p.sessions))
+				log.Printf("batches=%d frames=%d events=%d epochs=%d duplicates=%d missing=%d skipped=%d sessions=%d",
+					p.batches, p.frames, p.events, p.epochs, p.duplicates, p.missing, p.unknown, len(p.sessions))
 			}
 			lastStats, lastBatches = now, p.batches
 		}

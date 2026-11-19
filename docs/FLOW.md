@@ -23,13 +23,17 @@ flowchart LR
     RAW --> P[processor<br/>Go]
     P -- "FeatureFrame<br/>every 0.5 s" --> FEAT[[eeg.features]]
     P -- "Event" --> EV[[eeg.events]]
+    P -- "Epoch<br/>per marker" --> EP[[eeg.epochs]]
+    RAW --> REC[recorder<br/>Go]
+    REC -- "chunks, then<br/>one EDF+ file" --> S3
     FEAT --> API
     EV --> API
-    API -- "events, 10 s rollups" --> PG
+    EP --> API
+    API -- "events, epochs, 10 s rollups" --> PG
     API -- "WebSocket: live frames<br/>REST: history" --> WEB
 ```
 
-One recording becomes a live stream, and the stream becomes rhythm strength and events. Those go two ways at once: straight to the browser over a WebSocket, and into Postgres for history. The live path never waits on the database.
+One recording becomes a live stream, and the stream becomes rhythm strength and events. Those go two ways at once: straight to the browser over a WebSocket, and into Postgres for history. The live path never waits on the database. Next to the processor, the recorder reads the same raw stream and keeps it as one EDF+ file per session.
 
 A session can start three ways, and all three feed the same pipeline: a built-in sample, an uploaded file, or the replayer run by hand in a terminal.
 
@@ -41,9 +45,10 @@ A session can start three ways, and all three feed the same pipeline: a built-in
 | replay worker | `replayer/worker.py` | Picks up replay jobs (samples and uploads) and runs the replayer for each |
 | gateway | `gateway/` | Checks the token, validates every batch, forwards it to Kafka. Computes nothing |
 | processor | `processor/` | Turns raw samples into band power, quality flags and events. Talks only to Kafka (and reads session details from Postgres) |
-| api | `api/` | Stores events and rollups; serves history over REST; pushes live frames over WebSocket; accepts uploads |
+| recorder | `recorder/` | Keeps the raw signal: chunks in file storage while a session runs, one EDF+ file once it ends |
+| api | `api/` | Stores events and rollups; serves history and recordings over REST; pushes live frames over WebSocket; accepts uploads |
 | web | `web/` | The pages: start a session, then watch it live on a 3D head |
-| file storage | SeaweedFS in Compose | Keeps uploaded EDF files behind the S3 API (S3 itself on AWS) |
+| file storage | SeaweedFS in Compose | Keeps uploaded EDF files and the recorder's files behind the S3 API (S3 itself on AWS) |
 | signal math | `internal/eeg/` | FFT, band power, quality rules; shared by processor and api |
 | contract | `proto/neuro/v1/` | The message formats every piece agrees on |
 | featuretail | `tools/featuretail/` | Terminal viewer for what the processor writes (debugging only) |
@@ -55,11 +60,14 @@ A session can start three ways, and all three feed the same pipeline: a built-in
 | From → to | Message | Size per session | Rate per session |
 | --- | --- | --- | --- |
 | replayer → gateway | `SessionHeader`, once per connection | names of 64 sensors | once |
-| replayer → gateway | `SampleBatch`: 16 samples × 64 sensors | 1,024 floats ≈ 4 KB | 10 a second |
+| replayer → gateway | `SampleBatch`: 16 samples × 64 sensors, plus any markers that fall on those samples | 1,024 floats ≈ 4 KB | 10 a second |
 | gateway → `eeg.raw` | the same `SampleBatch`, unchanged | ≈ 4 KB | 10 a second |
 | processor → `eeg.features` | `FeatureFrame`: 64 sensors × 5 bands + 64 quality flags | 320 floats | 2 a second |
-| processor → `eeg.events` | `Event` (`channel_bad`, `channel_recovered`, `alpha_rise`) | small | only when something happens |
-| api → Postgres | one `rollups` row per 10 seconds, event rows as they come | | 0.1 rows a second plus events |
+| processor → `eeg.events` | `Event` (`channel_bad`, `channel_recovered`, `alpha_rise`, `eye_movement`, `muscle`, `marker`) | small | only when something happens |
+| processor → `eeg.epochs` | `Epoch`: 21 windows × 64 sensors × 5 bands around one marker, plus 1.8 s of raw signal for the ERP | 25,152 floats ≈ 100 KB | one per marker, 4 s after it |
+| recorder → file storage | one chunk: the session's batches of the last 2 seconds, as they came from Kafka | ≈ 80 KB | one every 2 seconds |
+| recorder → file storage | the EDF+ file: 16 bits per sample | ≈ 20 KB per second of signal | once, after the session ends |
+| api → Postgres | one `rollups` row per 10 seconds, event and epoch rows as they come | | 0.1 rows a second plus events |
 | api → browser | one band of a frame: 64 values + 64 quality flags, as JSON | about 1 KB | 2 a second per viewer |
 
 Every Kafka message is **keyed by `session_id`**. Kafka sends all messages with the same key to the same partition, so one session's data always stays in order.
@@ -68,13 +76,16 @@ Every Kafka message is **keyed by `session_id`**. Kafka sends all messages with 
 
 | Table | Written by | Read by |
 | --- | --- | --- |
-| `sessions` | gateway (when the header arrives, and when the stream ends) | processor, api |
+| `sessions` | gateway (when the header arrives, and when the stream ends, with the last `seq`); api (study, participant and task only) | processor, recorder, api |
+| `studies` | api REST | api REST (study pages, BIDS export) |
 | `events` | api store consumer | api REST |
 | `rollups` | api store consumer | api REST |
+| `epochs` | api store consumer | api REST (`/responses`, `/erp`) |
+| `recordings` | recorder (progress after every chunk; the file's state once written) | api REST (session state, download) |
 | `replays` | api (queues a job), replay worker (claims it, records the result) | api REST, the session page while it waits |
 | `summaries` | nobody yet (build step 11) | |
 
-Raw samples are never stored in Postgres. The EDF files remain the source.
+Raw samples are never stored in Postgres. They live in file storage: the uploaded or sample EDF file a replay came from, and the recorder's own file of every session.
 
 ## Two clocks
 
@@ -91,8 +102,9 @@ Recording time does not change with replay speed, reconnects or which processor 
 
 Every step is **at least once**: after a crash, some messages can be read or sent again. Duplicates are made harmless at every layer:
 - the processor drops a batch whose `seq` it has already seen;
-- events have a `UNIQUE` constraint plus `ON CONFLICT DO NOTHING`;
-- a rollup row is only replaced by one built from at least as many frames.
+- events have a `UNIQUE` constraint plus `ON CONFLICT DO NOTHING`, and epochs a primary key on session and marker sample;
+- a rollup row is only replaced by one built from at least as many frames;
+- the recorder names each chunk by the `seq` range it holds, and its merge drops any batch at or below the last `seq` it took.
 
 Consumers commit Kafka offsets only **after** their output is written, so nothing is lost.
 
@@ -132,7 +144,8 @@ sequenceDiagram
 1. `load_edf(path)` reads the file with MNE (`read_raw_edf`).
 2. Each channel name goes through `normalize_channel_name`, which strips the dots the dataset adds and fixes the casing against MNE's standard layout (`"Fc5."` → `"FC5"`).
 3. Values are converted from volts to **microvolts** as `float32` and transposed to one row per sample, giving shape `(samples, 64)`.
-4. It returns a `Recording`.
+4. `read_markers` turns the file's annotations into markers: sample index, label, duration.
+5. It returns a `Recording`.
 
 **`replay.py`**
 1. `main()` parses the flags (`--file`, `--gateway`, `--session-id`, `--speed`, `--flatten`, `--token`).
@@ -140,7 +153,7 @@ sequenceDiagram
 3. `Replay(rec, session_id, speed)` works out `batch_samples = 16` (100 ms at 160 Hz) and `num_batches`.
 4. `Replay.requests()` is a **generator** that gRPC pulls messages from:
    - It yields the `SessionHeader` first.
-   - It yields one `SampleBatch` per 100 ms, from `next_seq` on. Each send time is scheduled against `time.monotonic()` (`due = t0 + n × 0.1 / speed`), so timing never drifts.
+   - It yields one `SampleBatch` per 100 ms, from `next_seq` on, carrying the markers whose sample is in it. Each send time is scheduled against `time.monotonic()` (`due = t0 + n × 0.1 / speed`), so timing never drifts.
    - It updates `next_seq` after each batch is taken.
 5. The reconnect loop in `main()` works like this:
    - **Retryable errors** (`UNAVAILABLE`, `DEADLINE_EXCEEDED`, `ABORTED`): it moves `next_seq` back by `REWIND_BATCHES = 10`, because batches that were in flight may be lost. It waits with backoff (0.5 s doubling to 10 s), then opens a new stream. That stream resends the header with the same `session_id` and continues `seq`.
@@ -171,7 +184,7 @@ flowchart TD
    - `authorized()` looks for `authorization: Bearer <token>` in the gRPC metadata. It compares in constant time.
    - The first message must be a header. `validateHeader()` checks it has a session ID, a positive sample rate and at least one channel.
    - `saveSession()` runs `INSERT … ON CONFLICT DO UPDATE SET status='live'`. A reconnect with the same ID therefore just sets the session live again; `started_at` never changes.
-   - For each batch, `validateBatch()` checks three things: the same session ID, 1 to 16 samples, and exactly `num_samples × channels` values.
+   - For each batch, `validateBatch()` checks the same session ID, 1 to 16 samples, exactly `num_samples × channels` values, and its markers (`validateMarkers()`): at most 32, each with a label of 1 to 64 bytes and a sample index inside the batch.
    - `publish()` serialises the batch and calls `ProduceSync`, which **waits** until Kafka confirms. So a batch the gateway counted is a batch Kafka has. It also means one session's batches go out one at a time, in order.
    - When the client closes the stream (`io.EOF`), `endSession()` sets `status='ended'` and the gateway replies with an `IngestSummary`.
 
@@ -208,8 +221,9 @@ flowchart TD
 `session.add(batch)` does the following:
 1. **Duplicate:** if `seq ≤ lastSeq`, it drops the batch and reports `duplicate`.
 2. **Gap:** if `seq > lastSeq + 1`, it clears the buffer and reports `gap`. The next window starts 2 seconds later.
-3. It copies each of the 16 rows into the ring.
-4. After each row, it checks whether the buffer is full and `sampleCount % 80 == 0`, that is, every 0.5 s on the **recording's** sample positions. If so, it runs:
+3. `markerEvents(batch)` turns the batch's markers into `marker` events (see "Markers" below).
+4. It copies each of the 16 rows into the ring.
+5. After each row, it checks whether the buffer is full and `sampleCount % 80 == 0`, that is, every 0.5 s on the **recording's** sample positions. If so, it runs:
    - `compute(windowIndex)` to get a `FeatureFrame`;
    - `detect(frame)` to get events.
 
@@ -242,8 +256,9 @@ flowchart TD
 | `channel_recovered` | A bad sensor is OK for 3 windows in a row |
 | `alpha_rise` | Mean back-of-head alpha is above 1.5 × the session's running average for 4 windows. It needs 10 windows of history first, and fires once per rise |
 | `eye_movement`, `muscle` | See "Eye movements and muscle activity" below |
+| `marker` | One per marker the batch carries. See "Markers" below |
 
-The event time is `windowTime(windowIndex)`, which is recording time (see "Two clocks").
+The event time is `windowTime(windowIndex)`, which is recording time (see "Two clocks"). A marker's time is `sampleTime(sampleIndex)`, on the same clock.
 
 ## 4. Api (`api/`)
 
@@ -293,6 +308,13 @@ flowchart TD
 | `DELETE /sessions/{id}` | `deleteSession` | removes an ended session with its events, rollups and replay job in one transaction; 409 while it is live |
 | `GET /sessions/{id}/events` | `listEvents` | `ORDER BY at, id` |
 | `GET /sessions/{id}/rollups?from=&to=` | `listRollups` | `from <= bucket_start < to`, both optional (RFC 3339), plus the band names |
+| `GET /sessions/{id}/responses?band=` | `listResponses` | the session's epochs, averaged per marker label for one band (see "Averaged response") |
+| `GET /sessions/{id}/erp?reject=` | `getERP` | the voltage averaged per marker label, filtered and baselined, trials over `reject` µV left out per sensor (see "ERP") |
+| `GET /sessions/{id}/recording.edf` | `getRecording` | the recorder's EDF+ file (see "Recording") |
+| `PUT /sessions/{id}/study` | `setSessionStudy` | `{studyId, participant, task}` sets all three; `studyId: ""` takes the session out (see "Studies and BIDS") |
+| `GET /studies`, `POST /studies` | `listStudies`, `createStudy` | every study with its session count; a new empty study |
+| `GET /studies/{id}`, `DELETE /studies/{id}` | `getStudy`, `deleteStudy` | the study with its sessions; deleting keeps the sessions, untagged |
+| `GET /studies/{id}/bids.zip` | `exportBIDS` | the study as a BIDS dataset, streamed as a zip |
 
 ### Live view (`api/live.go`)
 
@@ -327,7 +349,7 @@ sequenceDiagram
 
 | Request | Handler | What it does |
 | --- | --- | --- |
-| `GET /samples` | `listSamples` | The three built-in samples |
+| `GET /samples` | `listSamples` | The four built-in samples |
 | `POST /samples/{name}/play?speed=1x\|fast` | `playSample` | Queues a replay of a sample; returns the new session ID |
 | `POST /uploads` (multipart `file`, `speed`) | `upload` | Checks, stores and queues an uploaded EDF; returns the session ID and what the header says |
 | `GET /replays/{id}` | `getReplay` | The job's state: queued, running, done or failed with a message |
@@ -431,7 +453,7 @@ sequenceDiagram
 6. `OrbitControls` allows rotation and limited zoom, no panning. The head turns slowly by itself until the first drag.
 7. `HeadScene` is wrapped in `memo` and gets only stable props, so the page's twice-a-second updates never re-render it.
 
-**`Timeline`** draws band strength over time. The page chooses the lines: the average of all sensors, one line per brain region, left against right, or the highlighted sensor alone. It also draws the baseline as a dashed line and a tick for each event.
+**`Timeline`** draws band strength over time. The page chooses the lines: the average of all sensors, one line per brain region, left against right, or the highlighted sensor alone. It also draws the baseline as a dashed line and a tick for each event, markers included.
 
 **`useBaseline`** reads the first three stored rollups (30 seconds) and averages them per sensor and band, leaving out rollups where the sensor was bad. The chart title and the popover compare against it ("+17% vs baseline").
 
@@ -468,7 +490,11 @@ Take sensor `O1`, seconds 30.0 to 30.1 of the eyes-closed recording:
 | A batch goes missing | The processor clears that session's buffer and counts a gap; windows resume 2 s later | `session.add` |
 | Processor crashes | Its output was not committed, so Kafka gives the batches again; buffers refill in 2 s | `processor.run` |
 | Api crashes mid-bucket | Offsets were held at the bucket's first frame, so the bucket is rebuilt whole | `store.commit` |
+| Api is stopped or redeployed | The store loop allows the group's rebalance as it exits, so `kafka.Close()` leaves the group at once and the next api takes over the partitions in seconds. Before this was fixed (2026-11-14), Close hung until Docker killed the process, and the next api stored nothing for about 45 s, Kafka's session timeout. Once, the store stayed stuck for over 5 minutes until the api was restarted; that was not reproduced | `store.run` |
 | Postgres down | Processor and api retry with backoff and hold their offsets | `loadSession`, `retry` |
+| Recorder crashes | Batches since its last flush were not committed, so Kafka gives them again; the merge drops any copies. Tested with `scripts/recorder_crash.ps1` | `recorder.flush`, `merger.add` |
+| File storage down | The recorder retries the chunk upload and holds its offsets, so Kafka keeps the batches; the live view is unaffected | `recorder.upload`, `retry` |
+| A stream breaks without a clean end | The recorder writes the file once nothing has arrived for 2 minutes; if the stream comes back, the file is written again | `recorder.claim` |
 | Wrong token | gateway: `UNAUTHENTICATED`; REST: 401 | `authorized`, `requireToken` |
 | Wrong-size batch | `INVALID_ARGUMENT`, stream ends | `validateBatch` |
 | A viewer is slow | It skips to the newest frame; other viewers are unaffected | `viewer.offerFrame` |
@@ -484,7 +510,7 @@ Tested so far: gateway restart, api restart mid-bucket, wrong token (gRPC, REST 
 # Running it
 
 ```powershell
-docker compose up -d --build                     # the whole stack
+docker compose up -d --build                     # the whole stack (also applies db/schema.sql to an existing database)
 # then open http://localhost:3000, play a sample or upload an .edf file
 ```
 
@@ -604,6 +630,98 @@ uv run --group lsl lsl_bridge.py         # terminal 2: the session appears on th
 
 Tested with the simulator only. No real amplifier has been connected.
 
+# Markers
+
+A marker says that something happened in the experiment at one exact sample: a picture was shown, a task began. Researchers cut the signal around markers, so a marker's position has to be exact.
+
+A marker is a `Marker{sample_index, label, duration_seconds}` inside the `SampleBatch` that holds its sample. It has no topic of its own. Riding with the samples gives three things for free:
+- it can never arrive before or after its samples, on any path;
+- a batch sent twice after a reconnect is dropped by `seq`, markers and all;
+- the processor that owns the session's samples also owns its markers.
+
+| Step | What happens | Where |
+| --- | --- | --- |
+| From a file | Each annotation in the EDF file becomes a marker at `round(onset × rate)` | `edf.read_markers` |
+| From a live stream | The bridge reads the first LSL stream of type `Markers` next to the EEG stream. Both carry times on one clock, so a marker's sample is found by counting back from the newest EEG sample. A marker whose sample was already sent goes on the next batch's first sample (at most 0.1 s late) and is counted | `Bridge.pull_markers`, `Bridge.take_markers` |
+| Gateway | Refuses a batch whose marker is outside the batch, has no label or a label over 64 bytes, or that carries more than 32 | `validateMarkers` |
+| Processor | Emits one `marker` event per marker, timed at the marker's own sample, with `{"label", "sample", "duration"}` as details. Markers on the same sample become one event with the labels joined by ` + `, because `events` keeps one row per session, type and time | `session.markerEvents` |
+| Api | Nothing special: a marker is stored and pushed to viewers like any other event | `store.handleEvent`, `hub.publishEvent` |
+| Web | The event list shows the label; the chart gets a thin grey tick; the events CSV has the label and the sample index | `eventText`, `MARK_KIND` |
+
+The sample "Left and right fist" (`S001R03.edf`) carries 30 markers: `T0` rest, `T1` left fist, `T2` right fist. `lsl_sim.py` publishes a file's markers as a second LSL stream.
+
+Measured on 2026-11-12: the sample replayed through the pipeline stored 30 of 30 markers at the file's own times (0, 4.2, 8.3, 12.5 s, …). Through the LSL simulator and bridge, 9 of 9 markers kept the file's spacing to the sample (672 and 656 samples apart) and none was late. Only one marker stream is read, and no real experiment software has been connected.
+
+# Averaged response
+
+One response to one cue is buried in noise. Researchers repeat the cue many times, cut the signal around each one (an epoch, or trial) and average the epochs of the same label. What survives is the brain's response to that kind of cue. Here the thing averaged is band power: "after a fist cue, alpha over the movement area drops by half for about two seconds".
+
+```mermaid
+flowchart LR
+    M[marker in a batch] --> S[session.startEpochs]
+    S --> T[session.stepEpochs<br/>21 windows, one every 0.25 s]
+    T -- "4 s after the marker" --> EP[[eeg.epochs]]
+    EP --> ST[store.handleEpoch<br/>writeEpochs]
+    ST --> PG[(epochs table)]
+    PG --> R[GET /responses<br/>averageResponses]
+    R -- "every 2 s while live" --> W([ResponseChart])
+```
+
+**Processor (`processor/epochs.go`).** An epoch is 21 windows of 1 second, one every 0.25 s. The first 5 end at 1 s before the marker up to exactly at it, so they hold only signal from before it. The other 16 end 0.25 s to 4 s after it.
+1. `startEpochs()` opens a `pendingEpoch` for each marker of a batch.
+2. `stepEpochs()` runs after every sample row. At the marker's own sample it computes the 5 "before" windows at once, reading back through the 2-second buffer. After that it computes one window every 40 samples. Windows sit at fixed sample positions from the marker, so an epoch computed twice is the same epoch.
+3. `epochStepPower()` calls `Analyzer.Power()` for each sensor. This is the same FFT as the live frames, but the band power is **not** divided by the total: the absolute amount is needed to say "half of what it was". A sensor that is flat or noisy in any window is marked bad for the whole epoch.
+4. After the 21st window `finishEpoch()` builds the `Epoch` message, and `handle()` sends it to `eeg.epochs`, keyed by session ID.
+
+An epoch is dropped when its marker comes before the buffer is full (the first 2 seconds of a stream, or right after a gap), when a batch goes missing before it is complete, or when the processor restarts in the middle of it. Nothing is stored for a dropped epoch; its marker event is still stored.
+
+**Api (`api/responses.go`).** The store consumer reads `eeg.epochs` next to the other two topics. `handleEpoch()` checks the sizes against the session's channels; `writeEpochs()` inserts the poll's epochs in one batch with `ON CONFLICT DO NOTHING`. Each epoch is kept whole, one row per trial, so the average can be recomputed in any band. `listResponses()` reads the session's rows and `averageResponses()` averages them per label; for each sensor it leaves out the trials where that sensor was bad, and reports how many trials went in.
+
+**Web.** The rail shows "Averaged response" once the session has a marker. `useResponses` asks the api every 2 seconds while the session is live. The session page turns the power into a change against the 5 "before" windows, for the highlighted sensor or averaged over all sensors, and `ResponseChart` draws one line per label with its trial count.
+
+Measured on 2026-11-12 with the sample "Left and right fist": 29 of 30 markers gave an epoch (the first marker is at sample 0, with nothing before it). At sensors C3 and C4, over the movement area, alpha fell 50 to 70% about 1 to 1.5 s after the fist cues `T1` and `T2` and rose after the rest cue `T0`, which is the result the literature reports for this task. With 7 or 8 trials per label the left/right difference is not clear.
+
+Limits, for anyone using it as a result: a 1-second window blurs timing to about a second; the bad-sensor rule is the same simple threshold as the live view, so eye blinks reach the frontal sensors' averages; and no statistics are computed.
+
+Checked on 2026-11-14 with `replayer/check_responses.py`, which recomputes every epoch from the original file without NeuroHalo code: MNE reads the file and its annotations, the windows are cut at the same samples, and MNE's `psd_array_welch` (one Hann segment per window) gives the band power. Same file, replayed whole: the same 29 trials, the same sensors left out of each, and in all 5 bands, 3 labels, 64 sensors and 21 steps the averaged power equals MNE's times 4,800 to within 1.4 × 10⁻⁷. That factor is not fitted luck: MNE reports µV²/Hz, and turning a Hann-windowed FFT into that divides by sample rate × Σ window² ÷ 2 = 160 × 60 ÷ 2. The change from before the marker, which is what the page shows, matches within 0.0001 percentage points.
+
+# ERP
+
+The averaged response above follows rhythms, in 1-second windows. The ERP (event-related potential) is the other half of what labs average: the voltage itself, sample by sample, in the second after a cue. A single trial's response is a few microvolts buried in signal ten times larger; the parts not locked to the cue average out over trials, and what is left is the brain's response, with peaks a researcher reads by their timing (for example a dip about 100 ms after a picture, over the back of the head).
+
+```mermaid
+flowchart LR
+    M[marker in a batch] --> S[session.startEpochs]
+    S --> C[session.copyVoltage<br/>1.3 s after the marker]
+    C --> E[[eeg.epochs<br/>same message]]
+    E --> PG[(epochs.voltage)]
+    PG --> R[GET /sessions/id/erp<br/>filter, cut, baseline, reject, average]
+    R -- "every 2 s while live" --> W([ResponseChart, in µV])
+```
+
+**Processor (`processor/epochs.go`).** Each epoch also keeps the raw signal from 0.5 s before to 1.3 s after its marker (288 samples × 64 sensors at 160 Hz). `stepEpochs()` calls `copyVoltage()` when the stretch's last sample arrives; it copies the newest 288 rows out of the 2-second buffer. The stretch rides in the same `Epoch` message (`voltage`, `voltage_samples`, `voltage_pre`), so it is dropped, duplicated and deduplicated exactly like the band power. The processor does no filtering: the stored stretch is what the batches carried.
+
+**Api (`api/erp.go`).** `writeEpochs()` stores the stretch in `epochs.voltage`. `GET /sessions/{id}/erp?reject=100` reads every stretch and, per trial and sensor, `erpTrial()` does the usual ERP steps:
+
+| Step | What | Why |
+| --- | --- | --- |
+| Low-pass at 30 Hz | `lowpassKernel()` builds the filter MNE's `filter_data` designs by default (71 taps at 160 Hz, Hamming-windowed sinc, zero phase), tap for tap | Removes mains hum and muscle noise. Zero phase means the peaks do not move in time |
+| Cut 0.2 s before to 0.8 s after | 161 samples. The stretch's extra 0.3 s on each side covers the filter's reach (35 samples), so the result equals filtering the whole recording first | The usual ERP window |
+| Baseline | Subtract the mean of the 0.2 s before the marker, up to and including it | Every trial starts at 0 µV, so slow drift does not move the average |
+| Reject | Leave the trial out for this sensor if its peak-to-peak is above `reject` µV (100 by default, 0 keeps all) or below 1 µV (flat) | A blink or movement is hundreds of µV and would swamp a few-µV response |
+
+`averageERP()` averages per label and reports, per sensor, how many trials were kept.
+
+**Data quality: the SME.** An average from 5 noisy trials and one from 50 clean ones can look alike; what differs is how much they would change with other trials. ERP researchers now report that as the SME (standardized measurement error, Luck et al. 2021): for a score such as "the mean voltage from 300 to 400 ms", the SME is that score's standard error over trials, the standard deviation of the trials' scores divided by the square root of their number. It is in µV, it shrinks as trials are added, and it grows when trials are noisy, so it answers "is this recording good enough yet?" while the participant is still there. `averageERP()` gives the SME of the mean voltage in each 100 ms bin, ERPLAB's default, from the trials kept for each sensor (−1 below 2 trials). The chart draws each as a thin bar of one SME above and below the bin's mean, and the line's label ends with one number, "±12.3 µV": the root mean square of the SMEs of the bins after the marker, as ERPLAB summarises them. No high-pass filter is applied: a 0.1 Hz high-pass needs about 30 seconds of signal, and the baseline removes the drift within each 1-second trial. Computing on request, not in the processor, keeps the threshold a choice made while looking at the data, as it is in ERPLAB.
+
+**Web.** "ERP" in the rail, once the session has a marker. The chart shows one line per label for the highlighted sensor, or Cz, in µV from −200 to +800 ms. The header switches the threshold between 100 µV, 200 µV and keeping all trials, and each line's label reads "T1 · 5/8": trials kept for this sensor, of all the label's trials. A label with none kept shows "0/8" and no line.
+
+Checked on 2026-11-15 with `replayer/check_erp.py`, which uses MNE only: it filters the original file with `raw.filter(None, 30)`, cuts the trials with `mne.Epochs(tmin=-0.2, tmax=0.8, baseline=(None, 0))` and applies the same per-sensor rejection. "Left and right fist" replayed whole: the same 29 trials, the same trials kept per sensor at 100 µV, 200 µV and none, every averaged sample of 64 sensors and 3 labels within 0.00002 µV, and every bin's SME (recomputed with NumPy from the MNE epochs) within 0.00001 µV.
+
+What the check also showed: this sample is far too noisy for the usual 100 µV threshold. After the 30 Hz filter the median trial swings 207 µV peak to peak, and 400 µV over the forehead. At 100 µV Cz keeps no trial at all; at 200 µV it keeps 1 of 8 left-fist trials. The rule is doing its job: these recordings (BCI2000, 2004) were made for movement studies, which look at rhythms, not ERPs. A recording made for ERPs, with a good amplifier and a still participant, keeps most of its trials at 100 µV.
+
+Limits: rejection is per sensor, so different sensors can average different trials (MNE and ERPLAB usually drop the whole trial when any sensor fails; the chart's counts show the difference); the window, the 30 Hz filter and the 100 ms bins are fixed; there is no "trials still needed" yet, because that needs a target SME, which depends on the effect a study looks for; no statistics are computed. The raw stretch grows with sample rate and sensor count, and an `Epoch` must stay under Kafka's 1 MB message limit: about 0.5 MB at 1,000 Hz with 64 sensors, but too close at 2,000 Hz or with 128 sensors at 1,000 Hz.
+
 # Eye movements and muscle activity
 
 `processor/artifacts.go` flags two kinds of signal that come from the body, not the brain. Each is one event when it starts.
@@ -614,6 +732,74 @@ Tested with the simulator only. No real amplifier has been connected.
 | `muscle` | Gamma (30 to 45 Hz) is above 30% of a sensor's power on at least 3 good sensors, for 2 windows in a row |
 
 The 0.1-second smoothing also removes mains hum, which is strong in the sample recordings. The thresholds were set on those recordings (eyes open: 8 eye events a minute; eyes closed: 3 to 6, since eyes also move under closed lids). They are rules of thumb and have not been checked against hand-labelled data. The session page lists both events in the rail; they get no tick on the chart.
+
+# Recording
+
+The pipeline above computes from the raw signal and then lets it go. A lab needs the signal itself, in a file its analysis tools open. The recorder keeps it: every session becomes one EDF+ file, the format EEGLAB, MNE, Brainstorm and EDFbrowser all read, with the markers inside it as annotations.
+
+```mermaid
+flowchart LR
+    RAW[[eeg.raw]] --> H[recorder.handle<br/>add to the session's chunk]
+    H -- "every 2 s" --> F[recorder.flush]
+    F -- "chunk per session" --> S3[(file storage<br/>spool/id/...)]
+    F -- "saved_seq" --> PG[(recordings)]
+    F -- "then commit offsets" --> RAW
+    PG -- "ended, last seq saved" --> C[recorder.claim]
+    C --> M[merger.add<br/>chunks in seq order]
+    M --> E[writeEDF]
+    E -- "recordings/id.edf" --> S3
+    S3 --> D[GET /sessions/id/recording.edf]
+```
+
+**While the session runs (`recorder/main.go`).** The recorder reads `eeg.raw` as its own consumer group, `recorder`. Kafka gives every group all the messages, so the processor and the recorder each see every batch and neither waits for the other. On its very first start the group begins at the newest batch: the oldest ones in `eeg.raw` are whatever retention has not deleted yet, and starting there would write files that silently miss the start of their session.
+1. `handle()` adds each batch, as the bytes Kafka delivered, to its session's `chunk`. It drops a batch whose `seq` it has already taken (the replayer resends 10 batches after a reconnect). A session from source `loadgen` is not recorded (`SKIP_SOURCES`), or a load test would store gigabytes of the same minute.
+2. Every 2 seconds `flush()` uploads each session's chunk to `spool/<id>/<first seq>-<last seq>.bin`, writes the highest `seq` stored per session to `recordings.saved_seq` in one statement, and only then commits the Kafka offsets. If file storage is down it keeps retrying and commits nothing, so Kafka keeps the batches.
+
+**When the session ends (`recorder/finalize.go`).** When the stream closes cleanly, the gateway writes the `seq` of the stream's last batch to `sessions.last_seq`. Every 2 seconds `claim()` marks as `writing` each recording whose session has ended and whose `saved_seq` has reached `last_seq`, so the file is written only once every batch is in a chunk. A session that stopped without a clean end is claimed once it has been quiet for 2 minutes. The claim is one `UPDATE … RETURNING`, so two recorders never write the same file. Then `finalize()`:
+1. Lists the session's chunks. Their names start with the first `seq`, zero-padded, so name order is `seq` order.
+2. Feeds every batch to `merger.add()`, which writes the samples to a temporary file. A batch at or below the last `seq` taken is a copy and is skipped. Samples missing between two batches are written as 0 µV under a `NeuroHalo: no data` annotation, so every later sample keeps its true time. Each marker becomes an annotation at its own sample.
+3. `writeEDF()` reads that file back, writes the EDF+ file in 1-second data records, and uploads it to `recordings/<id>.edf`. Both passes go through disk, so a long session never has to fit in memory.
+
+**The file (`recorder/edf.go`).** EDF keeps each sample as a 16-bit integer, and its header says, per sensor, which range of microvolts the integers span. The recorder knows the whole recording when it writes the header, so it uses each sensor's own smallest and largest value. On the samples that is about 0.016 µV per step, far finer than the noise of any EEG amplifier. The header range is rounded outwards to fit the format's 8-character fields. The last record is filled up with 0 µV under a `no data` annotation. The start time is the session's start, in UTC, and the patient fields are left as unknown (`X`).
+
+**Api and web.** `GET /sessions/{id}` includes `recording: {status, bytes, seconds}`. `GET /sessions/{id}/recording.edf` streams the file from file storage, with range support; it answers 409 while the file is not written yet. A plain link cannot send a header, so this one path also takes the token as `?token=`, like the WebSocket. After a session ends, the session page asks again every 2 seconds until the file is ready, then shows "Recording EDF" next to the CSV exports. Deleting a session removes its chunks and its file.
+
+Checked on 2026-11-13 with `replayer/check_recording.py`, which reads the file with MNE and compares it with the original sample as the replayer sent it. "Left and right fist", replayed at full speed: 64 of 64 sensor names, 160 Hz, 20,000 of 20,000 samples, every sample within half a step (worst: 0.008 µV on Fpz), 30 of 30 markers on their own sample with label and duration, no missing stretch. The same check passed after `scripts/recorder_crash.ps1` killed the recorder 30 seconds into a real-time replay and kept it down for 26 seconds.
+
+Limits: the chunks are kept until the session is deleted, so a session takes about three times its EDF size in file storage. The file holds what reached the gateway, so samples an amplifier dropped before that are not marked. Only EDF+ is written (no BDF). A study's sessions download as a BIDS folder (next section).
+
+# Studies and BIDS
+
+A lab does not want 40 loose sessions; it wants "participant 07, resting task, second run", in the layout its analysis scripts already read. That layout is BIDS (Brain Imaging Data Structure): fixed folder and file names, plus small text files that say what each recording is. EEGLAB, MNE-BIDS and FieldTrip read it, and OpenNeuro, the public archive, only accepts it.
+
+**Tagging (`api/studies.go`).** A study is a row in `studies`. `PUT /sessions/{id}/study` sets a session's `study_id`, `participant` and `task`. Participant and task become part of file names, so `bidsLabel` allows only letters and digits, as BIDS does; the web page checks the same rule first. Any session can be filed, a live one too, so an amplifier session can be filed while it records. Deleting a study only untags its sessions.
+
+**Export (`api/bids.go`).** `exportBIDS()` reads the study's sessions with their recording's state. Sessions whose EDF file is not ready are left out and named in the dataset's README with the reason. `numberRuns()` sorts the rest by participant, task and start time, and numbers the sessions of a participant and task that has more than one (`_run-1`, `_run-2`). The markers come from each session's `marker` events. `bidsMetadata()` builds the small files, which are pure functions of these rows and are unit-tested:
+
+| File | Holds |
+| --- | --- |
+| `dataset_description.json` | the study's name, BIDS version 1.10.0, "generated by NeuroHalo" |
+| `README` | what was exported, how the EDF files were made, and what was left out |
+| `participants.tsv` | one `sub-<label>` per participant |
+| `task-<task>_events.json` | what the `trial_type` and `sample` columns mean; one per task, inherited by every run of it |
+| `sub-<p>/eeg/..._eeg.json` | task, sample rate, sensor count, duration. Reference, mains frequency and amplifier filters are `n/a`: NeuroHalo is not told them |
+| `..._channels.tsv` | every sensor as `EEG`, `µV`, under the name the EDF header gives it (`recording.EDFLabel`, shared with the recorder: printable ASCII, 16 characters), with `status` and `status_description` from the live check (below) |
+| `..._events.tsv` | one line per marker: onset and duration in seconds, label, sample |
+| `..._eeg.edf` | the recorder's file, copied unchanged from file storage |
+
+The zip is written straight into the response, the EDF files streamed from file storage one after another, so a large study never sits in memory. If file storage fails half-way, `abortDownload()` cuts the connection, so the browser reports a failed download rather than saving a broken zip. A link cannot send a header, so this path takes the token as `?token=`, like the EDF download.
+
+**Web (`web/src/app/studies/`).** "Studies" in the home page's top bar lists the studies. A study's page shows its sessions with participant, task, the file name each will get (computed the same way as `numberRuns()`), the recorded length and the recording's state; it reloads every 3 seconds while a file is still being written. Below, a session outside any study can be added with a participant and task, which stay filled for the next run.
+
+Checked on 2026-11-14 on a study of 4 recordings (two "fist" runs of participant 01, rest for 02 and 03) plus one session still recording. The official BIDS validator 3.0.2 reported no errors; its warnings ask for authors, equipment software versions and HED tags, which only the lab knows. MNE-BIDS read every recording back: 3 participants, 2 tasks, 64 sensors at 160 Hz each, and all 30 markers per fist run. The session still recording was left out and named in the README.
+
+**Bad sensors (`sensorStatus`).** The processor already flags a sensor while the session runs (`channel_bad` after 3 flat or noisy windows in a row, `channel_recovered` after 3 good ones). Each event carries its window number, and window `w` ends at sample `w × hop`, so the export knows on the recording's own clock when every flag began and ended. `sensorStatus()` adds up each sensor's flagged stretches, to the next recovery or to the end of the recording. A sensor flagged for more than half the recording (`badShare`) gets `status` `bad`; MNE-BIDS puts it straight into `raw.info["bads"]`, so analyses leave it out without anyone marking it by hand. Every flagged sensor gets a `status_description` such as "flagged flat by the live check for 38 of 61 s (62%), from 23 s", so a lab with a stricter rule can apply its own.
+
+Checked on 2026-11-14 with the sample where Cz fails at 20 s: Cz came out `bad`, "flat … from 23 s" (the 2-second window must be wholly flat, then 3 windows in a row confirm it), and MNE-BIDS read `bads = ['Cz']`. The BIDS validator still reported no errors.
+
+A caution found on the same run: in the "Left and right fist" recordings the forehead sensors Fp1, Fp2, AF7 and AF3 come out `bad`, noisy for 51 to 63% of the time. They sit above the eyes, so this is almost certainly blinking at each cue, not a broken sensor. Labs usually keep those sensors and remove blinks later (for example with ICA). The noisy rule (500 µV peak to peak) cannot tell the two apart yet.
+
+Limits: no session level (`ses-`), so a participant's visits on different days become runs of one session; every sensor is typed EEG, even an eye or heart channel; nothing about the participants (age, sex) is collected; and the bad-sensor status mistakes heavy blinking for a noisy sensor, as above.
 
 # Not built yet
 

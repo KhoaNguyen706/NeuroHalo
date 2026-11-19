@@ -22,8 +22,8 @@ export const BAND_SYMBOL: Record<Band, string> = { delta: "δ", theta: "θ", alp
 // Quality codes, as in the proto enum.
 export const QUALITY_NAME: Record<number, string> = { 0: "unknown", 1: "ok", 2: "flat", 3: "noisy" };
 
-// One session. Returned by: api.sessions, api.session. Used by: the home page
-// list and the session page.
+// One session. Returned by: api.sessions, api.session, api.setStudy; part of
+// StudyDetail. Used by: the home page list, the session page and the study page.
 export type Session = {
   id: string;
   label: string;
@@ -33,6 +33,30 @@ export type Session = {
   startedAt: string;
   endedAt: string | null;
   status: "live" | "ended";
+  recording: Recording | null; // null until the recorder has stored the first second
+  studyId: string; // "" when the session is in no study
+  participant: string; // who was recorded, inside the study
+  task: string; // what they did
+};
+
+// One study in the list. Returned by: api.studies. Used by: the studies page.
+export type Study = { id: string; name: string; createdAt: string; sessions: number };
+
+// One study with its sessions, ordered by participant, task and start time.
+// Returned by: api.study. Used by: the study page.
+export type StudyDetail = { id: string; name: string; createdAt: string; sessionList: Session[] };
+
+// BIDS_LABEL is what a participant or task may be: letters and digits only,
+// because they become part of the file names. The api checks the same rule.
+// Used by: the study page.
+export const BIDS_LABEL = /^[A-Za-z0-9]{1,32}$/;
+
+// The recorder's EDF file of a session's raw signal. Part of: Session.
+// Used by: the session page, which offers the download once it is ready.
+export type Recording = {
+  status: "recording" | "writing" | "ready" | "failed";
+  bytes: number; // the file's size, once ready
+  seconds: number; // the signal it holds, once ready
 };
 
 // A stored event. Returned by: api.events. Turned into a SessionEvent by fromStored.
@@ -44,6 +68,45 @@ export type SessionEvent = { type: string; channel: string; atMs: number; detail
 
 // A 10-second rollup. Returned by: api.rollups. Used by: useBaseline.
 export type Rollup = { bucketStart: string; bandPower: number[]; badChannels: string[]; frames: number };
+
+// The averaged response to one marker label, in one band.
+// Part of: Responses. Used by: the session page.
+export type LabelResponse = {
+  label: string;
+  trials: number; // markers with this label that have a finished epoch
+  good: number[]; // per channel: how many of those trials are in its average (bad ones are left out)
+  power: number[]; // steps x channels, row by row: mean band power, in an arbitrary unit
+};
+
+// The averaged responses of a session. Returned by: api.responses.
+// Used by: useResponses, the session page.
+export type Responses = {
+  band: Band;
+  times: number[]; // per step: seconds after the marker (the middle of the step's window)
+  preSteps: number; // the first this-many steps hold only signal from before the marker
+  stepSeconds: number;
+  windowSeconds: number;
+  labels: LabelResponse[];
+};
+
+// The ERP of one marker label: the voltage averaged over its trials.
+// Part of: Erp. Used by: the session page.
+export type LabelErp = {
+  label: string;
+  trials: number; // markers with this label that have a finished trial
+  good: number[]; // per channel: how many of those are in its average (over the threshold or flat: left out)
+  mean: number[]; // samples x channels, row by row: mean voltage in µV after filtering and baseline
+  sme: number[]; // bins x channels, row by row: SME of each bin's mean voltage in µV, -1 below 2 trials
+};
+
+// The ERPs of a session. Returned by: api.erp. Used by: the session page.
+export type Erp = {
+  times: number[]; // per sample: seconds after the marker, from -0.2 to 0.8
+  lowpassHz: number; // the low-pass filter applied before averaging
+  reject: number; // µV peak-to-peak above which a trial is left out; 0 keeps all
+  bins: number[]; // per SME bin (100 ms): its start, in seconds after the marker
+  labels: LabelErp[];
+};
 
 // The replay job behind a sample or upload. Returned by: api.replay.
 // Used by: the session page while it waits for the session to start.
@@ -105,6 +168,7 @@ export class ApiError extends Error {
 }
 
 // call sends one request with the token and returns the parsed JSON body.
+// Used by: every method of api, and by send.
 async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(API_URL + path, {
     ...init,
@@ -120,6 +184,11 @@ async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 const enc = encodeURIComponent;
 
+// send makes a call with a JSON body.
+function send<T>(method: string, path: string, body: unknown): Promise<T> {
+  return call<T>(path, { method, body: JSON.stringify(body), headers: { "Content-Type": "application/json" } });
+}
+
 export const api = {
   sessions: () => call<Session[]>("/sessions"),
   session: (id: string) => call<Session>(`/sessions/${enc(id)}`),
@@ -133,6 +202,11 @@ export const api = {
     const qs = q.size ? `?${q}` : "";
     return call<{ bands: Band[]; rollups: Rollup[] }>(`/sessions/${enc(id)}/rollups${qs}`);
   },
+  // responses returns the averaged response to each marker label in one band.
+  responses: (id: string, band: Band) => call<Responses>(`/sessions/${enc(id)}/responses?band=${enc(band)}`),
+  // erp returns the ERP of each marker label, leaving out per sensor the
+  // trials over `reject` µV peak-to-peak (0 keeps every trial).
+  erp: (id: string, reject: number) => call<Erp>(`/sessions/${enc(id)}/erp?reject=${reject}`),
   replay: (id: string) => call<Replay>(`/replays/${enc(id)}`),
   // replayFrom queues a new live replay of a session's recording, from `from`
   // seconds into it up to `to` seconds (to the end when `to` is 0).
@@ -150,7 +224,28 @@ export const api = {
     form.append("speed", speed);
     return call<{ sessionId: string }>("/uploads", { method: "POST", body: form });
   },
+  studies: () => call<Study[]>("/studies"),
+  study: (id: string) => call<StudyDetail>(`/studies/${enc(id)}`),
+  createStudy: (name: string) => send<{ id: string }>("POST", "/studies", { name }),
+  // deleteStudy removes a study; its sessions stay, untagged.
+  deleteStudy: (id: string) => call<{ deleted: string }>(`/studies/${enc(id)}`, { method: "DELETE" }),
+  // setStudy files a session in a study with its participant and task, or
+  // takes it out of its study when studyId is "".
+  setStudy: (sessionId: string, studyId: string, participant = "", task = "") =>
+    send<Session>("PUT", `/sessions/${enc(sessionId)}/study`, { studyId, participant, task }),
 };
+
+// bidsUrl is the download address of a study as a BIDS dataset (a zip). A
+// plain link cannot set headers, so the token travels in the query string.
+export function bidsUrl(id: string): string {
+  return `${API_URL}/studies/${enc(id)}/bids.zip?token=${enc(TOKEN)}`;
+}
+
+// recordingUrl is the download address of a session's EDF file. A plain link
+// cannot set headers, so the token travels in the query string.
+export function recordingUrl(id: string): string {
+  return `${API_URL}/sessions/${enc(id)}/recording.edf?token=${enc(TOKEN)}`;
+}
 
 // liveUrl is the WebSocket address for one session. Browsers cannot set
 // headers on a WebSocket, so the token travels in the query string.

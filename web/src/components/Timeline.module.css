@@ -53,6 +53,12 @@
   stroke-linejoin: round;
 }
 
+/* The ERP's error bars: one SME above and below each 100 ms bin's mean. */
+.errorBar {
+  stroke-width: 1;
+  opacity: 0.6;
+}
+
 .baseline {
   stroke: var(--ink-2);
   stroke-width: 1;
@@ -73,6 +79,11 @@
 
 .recovered {
   stroke: var(--dim);
+}
+
+.marker {
+  stroke: var(--ink-2);
+  stroke-width: 1;
 }
 
 .range {

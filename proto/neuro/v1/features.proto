@@ -3,7 +3,7 @@ package neuro.v1;
 
 option go_package = "github.com/neurohalo/neurohalo/gen/neuro/v1;neurov1";
 
-// What the processor writes to eeg.features and eeg.events.
+// What the processor writes to eeg.features, eeg.events and eeg.epochs.
 
 enum Quality {
   QUALITY_UNSPECIFIED = 0;
@@ -26,6 +26,30 @@ message Link {
   uint32 a = 1;
   uint32 b = 2;
   float strength = 3;                     // |Pearson r| over the 2-second window, 0..1
+}
+
+// The signal around one marker ("one trial"), as band power in short windows
+// that step from before the marker to after it. Averaging the epochs of one
+// label shows how the brain responds to that kind of cue.
+// Step i's window ends (i - (pre_steps - 1)) x step_seconds after the marker,
+// so the first pre_steps windows hold only signal from before it.
+message Epoch {
+  string session_id = 1;
+  string label = 2;                       // the marker's label
+  uint64 marker_sample = 3;               // the marker's position in the session
+  int64 time_unix_nanos = 4;              // the marker's time, on the recording's clock
+  uint32 steps = 5;
+  uint32 pre_steps = 6;
+  float step_seconds = 7;
+  float window_seconds = 8;
+  repeated float band_power = 9;          // steps x channels x 5 bands, absolute (arbitrary unit)
+  repeated bool bad = 10;                 // per channel: flat or noisy in any of the windows
+  // The raw signal around the marker, for the ERP (the average voltage after
+  // a cue). Sample voltage_pre is the marker's own sample, so the stretch
+  // starts voltage_pre samples before it. Unfiltered, as the batches carried it.
+  repeated float voltage = 11;            // voltage_samples x channels, row by row, uV
+  uint32 voltage_samples = 12;
+  uint32 voltage_pre = 13;
 }
 
 message Event {

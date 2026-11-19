@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x17neuro/v1/features.proto\x12\x08neuro.v1\"\x95\x01\n\x0c\x46\x65\x61tureFrame\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x14\n\x0cwindow_index\x18\x02 \x01(\x04\x12#\n\x1bnewest_sent_time_unix_nanos\x18\x03 \x01(\x03\x12\x12\n\nband_power\x18\x04 \x03(\x02\x12\"\n\x07quality\x18\x05 \x03(\x0e\x32\x11.neuro.v1.Quality\"i\n\x05\x45vent\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0c\n\x04type\x18\x02 \x01(\t\x12\x0f\n\x07\x63hannel\x18\x03 \x01(\t\x12\x17\n\x0ftime_unix_nanos\x18\x04 \x01(\x03\x12\x14\n\x0c\x64\x65tails_json\x18\x05 \x01(\t*W\n\x07Quality\x12\x17\n\x13QUALITY_UNSPECIFIED\x10\x00\x12\x0e\n\nQUALITY_OK\x10\x01\x12\x10\n\x0cQUALITY_FLAT\x10\x02\x12\x11\n\rQUALITY_NOISY\x10\x03\x42\x35Z3github.com/neurohalo/neurohalo/gen/neuro/v1;neurov1b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x17neuro/v1/features.proto\x12\x08neuro.v1\"\xb4\x01\n\x0c\x46\x65\x61tureFrame\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x14\n\x0cwindow_index\x18\x02 \x01(\x04\x12#\n\x1bnewest_sent_time_unix_nanos\x18\x03 \x01(\x03\x12\x12\n\nband_power\x18\x04 \x03(\x02\x12\"\n\x07quality\x18\x05 \x03(\x0e\x32\x11.neuro.v1.Quality\x12\x1d\n\x05links\x18\x06 \x03(\x0b\x32\x0e.neuro.v1.Link\".\n\x04Link\x12\t\n\x01\x61\x18\x01 \x01(\r\x12\t\n\x01\x62\x18\x02 \x01(\r\x12\x10\n\x08strength\x18\x03 \x01(\x02\"\x8a\x02\n\x05\x45poch\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\r\n\x05label\x18\x02 \x01(\t\x12\x15\n\rmarker_sample\x18\x03 \x01(\x04\x12\x17\n\x0ftime_unix_nanos\x18\x04 \x01(\x03\x12\r\n\x05steps\x18\x05 \x01(\r\x12\x11\n\tpre_steps\x18\x06 \x01(\r\x12\x14\n\x0cstep_seconds\x18\x07 \x01(\x02\x12\x16\n\x0ewindow_seconds\x18\x08 \x01(\x02\x12\x12\n\nband_power\x18\t \x03(\x02\x12\x0b\n\x03\x62\x61\x64\x18\n \x03(\x08\x12\x0f\n\x07voltage\x18\x0b \x03(\x02\x12\x17\n\x0fvoltage_samples\x18\x0c \x01(\r\x12\x13\n\x0bvoltage_pre\x18\r \x01(\r\"i\n\x05\x45vent\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0c\n\x04type\x18\x02 \x01(\t\x12\x0f\n\x07\x63hannel\x18\x03 \x01(\t\x12\x17\n\x0ftime_unix_nanos\x18\x04 \x01(\x03\x12\x14\n\x0c\x64\x65tails_json\x18\x05 \x01(\t*W\n\x07Quality\x12\x17\n\x13QUALITY_UNSPECIFIED\x10\x00\x12\x0e\n\nQUALITY_OK\x10\x01\x12\x10\n\x0cQUALITY_FLAT\x10\x02\x12\x11\n\rQUALITY_NOISY\x10\x03\x42\x35Z3github.com/neurohalo/neurohalo/gen/neuro/v1;neurov1b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -32,10 +32,14 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'neuro.v1.features_pb2', _gl
 if not _descriptor._USE_C_DESCRIPTORS:
   _globals['DESCRIPTOR']._loaded_options = None
   _globals['DESCRIPTOR']._serialized_options = b'Z3github.com/neurohalo/neurohalo/gen/neuro/v1;neurov1'
-  _globals['_QUALITY']._serialized_start=296
-  _globals['_QUALITY']._serialized_end=383
+  _globals['_QUALITY']._serialized_start=644
+  _globals['_QUALITY']._serialized_end=731
   _globals['_FEATUREFRAME']._serialized_start=38
-  _globals['_FEATUREFRAME']._serialized_end=187
-  _globals['_EVENT']._serialized_start=189
-  _globals['_EVENT']._serialized_end=294
+  _globals['_FEATUREFRAME']._serialized_end=218
+  _globals['_LINK']._serialized_start=220
+  _globals['_LINK']._serialized_end=266
+  _globals['_EPOCH']._serialized_start=269
+  _globals['_EPOCH']._serialized_end=535
+  _globals['_EVENT']._serialized_start=537
+  _globals['_EVENT']._serialized_end=642
 # @@protoc_insertion_point(module_scope)

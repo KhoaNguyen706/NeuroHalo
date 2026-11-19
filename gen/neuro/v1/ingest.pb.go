@@ -97,6 +97,7 @@ type SampleBatch struct {
 	SentTimeUnixNanos int64                  `protobuf:"varint,4,opt,name=sent_time_unix_nanos,json=sentTimeUnixNanos,proto3" json:"sent_time_unix_nanos,omitempty"` // wall clock when the sender sent it
 	NumSamples        uint32                 `protobuf:"varint,5,opt,name=num_samples,json=numSamples,proto3" json:"num_samples,omitempty"`
 	Values            []float32              `protobuf:"fixed32,6,rep,packed,name=values,proto3" json:"values,omitempty"` // num_samples x channels, row by row, microvolts
+	Markers           []*Marker              `protobuf:"bytes,7,rep,name=markers,proto3" json:"markers,omitempty"`        // what happened during these samples; usually empty
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -173,6 +174,76 @@ func (x *SampleBatch) GetValues() []float32 {
 	return nil
 }
 
+func (x *SampleBatch) GetMarkers() []*Marker {
+	if x != nil {
+		return x.Markers
+	}
+	return nil
+}
+
+// A marker says that something happened in the experiment at one sample: a
+// picture was shown, a task began. It travels inside the batch that holds its
+// sample, so it can never arrive out of order with the signal.
+type Marker struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	SampleIndex     uint64                 `protobuf:"varint,1,opt,name=sample_index,json=sampleIndex,proto3" json:"sample_index,omitempty"`              // position in the session, inside this batch
+	Label           string                 `protobuf:"bytes,2,opt,name=label,proto3" json:"label,omitempty"`                                              // as the experiment wrote it, e.g. "T1"
+	DurationSeconds float64                `protobuf:"fixed64,3,opt,name=duration_seconds,json=durationSeconds,proto3" json:"duration_seconds,omitempty"` // how long it lasted; 0 for a single moment
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *Marker) Reset() {
+	*x = Marker{}
+	mi := &file_neuro_v1_ingest_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Marker) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Marker) ProtoMessage() {}
+
+func (x *Marker) ProtoReflect() protoreflect.Message {
+	mi := &file_neuro_v1_ingest_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Marker.ProtoReflect.Descriptor instead.
+func (*Marker) Descriptor() ([]byte, []int) {
+	return file_neuro_v1_ingest_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *Marker) GetSampleIndex() uint64 {
+	if x != nil {
+		return x.SampleIndex
+	}
+	return 0
+}
+
+func (x *Marker) GetLabel() string {
+	if x != nil {
+		return x.Label
+	}
+	return ""
+}
+
+func (x *Marker) GetDurationSeconds() float64 {
+	if x != nil {
+		return x.DurationSeconds
+	}
+	return 0
+}
+
 type IngestRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Msg:
@@ -186,7 +257,7 @@ type IngestRequest struct {
 
 func (x *IngestRequest) Reset() {
 	*x = IngestRequest{}
-	mi := &file_neuro_v1_ingest_proto_msgTypes[2]
+	mi := &file_neuro_v1_ingest_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -198,7 +269,7 @@ func (x *IngestRequest) String() string {
 func (*IngestRequest) ProtoMessage() {}
 
 func (x *IngestRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_neuro_v1_ingest_proto_msgTypes[2]
+	mi := &file_neuro_v1_ingest_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -211,7 +282,7 @@ func (x *IngestRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IngestRequest.ProtoReflect.Descriptor instead.
 func (*IngestRequest) Descriptor() ([]byte, []int) {
-	return file_neuro_v1_ingest_proto_rawDescGZIP(), []int{2}
+	return file_neuro_v1_ingest_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *IngestRequest) GetMsg() isIngestRequest_Msg {
@@ -265,7 +336,7 @@ type IngestSummary struct {
 
 func (x *IngestSummary) Reset() {
 	*x = IngestSummary{}
-	mi := &file_neuro_v1_ingest_proto_msgTypes[3]
+	mi := &file_neuro_v1_ingest_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -277,7 +348,7 @@ func (x *IngestSummary) String() string {
 func (*IngestSummary) ProtoMessage() {}
 
 func (x *IngestSummary) ProtoReflect() protoreflect.Message {
-	mi := &file_neuro_v1_ingest_proto_msgTypes[3]
+	mi := &file_neuro_v1_ingest_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -290,7 +361,7 @@ func (x *IngestSummary) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IngestSummary.ProtoReflect.Descriptor instead.
 func (*IngestSummary) Descriptor() ([]byte, []int) {
-	return file_neuro_v1_ingest_proto_rawDescGZIP(), []int{3}
+	return file_neuro_v1_ingest_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *IngestSummary) GetBatchesReceived() uint64 {
@@ -317,7 +388,7 @@ const file_neuro_v1_ingest_proto_rawDesc = "" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12$\n" +
 	"\x0esample_rate_hz\x18\x02 \x01(\x01R\fsampleRateHz\x12#\n" +
 	"\rchannel_names\x18\x03 \x03(\tR\fchannelNames\x12\x16\n" +
-	"\x06source\x18\x04 \x01(\tR\x06source\"\xd6\x01\n" +
+	"\x06source\x18\x04 \x01(\tR\x06source\"\x82\x02\n" +
 	"\vSampleBatch\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x10\n" +
@@ -326,7 +397,12 @@ const file_neuro_v1_ingest_proto_rawDesc = "" +
 	"\x14sent_time_unix_nanos\x18\x04 \x01(\x03R\x11sentTimeUnixNanos\x12\x1f\n" +
 	"\vnum_samples\x18\x05 \x01(\rR\n" +
 	"numSamples\x12\x16\n" +
-	"\x06values\x18\x06 \x03(\x02R\x06values\"x\n" +
+	"\x06values\x18\x06 \x03(\x02R\x06values\x12*\n" +
+	"\amarkers\x18\a \x03(\v2\x10.neuro.v1.MarkerR\amarkers\"l\n" +
+	"\x06Marker\x12!\n" +
+	"\fsample_index\x18\x01 \x01(\x04R\vsampleIndex\x12\x14\n" +
+	"\x05label\x18\x02 \x01(\tR\x05label\x12)\n" +
+	"\x10duration_seconds\x18\x03 \x01(\x01R\x0fdurationSeconds\"x\n" +
 	"\rIngestRequest\x121\n" +
 	"\x06header\x18\x01 \x01(\v2\x17.neuro.v1.SessionHeaderH\x00R\x06header\x12-\n" +
 	"\x05batch\x18\x02 \x01(\v2\x15.neuro.v1.SampleBatchH\x00R\x05batchB\x05\n" +
@@ -349,23 +425,25 @@ func file_neuro_v1_ingest_proto_rawDescGZIP() []byte {
 	return file_neuro_v1_ingest_proto_rawDescData
 }
 
-var file_neuro_v1_ingest_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_neuro_v1_ingest_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
 var file_neuro_v1_ingest_proto_goTypes = []any{
 	(*SessionHeader)(nil), // 0: neuro.v1.SessionHeader
 	(*SampleBatch)(nil),   // 1: neuro.v1.SampleBatch
-	(*IngestRequest)(nil), // 2: neuro.v1.IngestRequest
-	(*IngestSummary)(nil), // 3: neuro.v1.IngestSummary
+	(*Marker)(nil),        // 2: neuro.v1.Marker
+	(*IngestRequest)(nil), // 3: neuro.v1.IngestRequest
+	(*IngestSummary)(nil), // 4: neuro.v1.IngestSummary
 }
 var file_neuro_v1_ingest_proto_depIdxs = []int32{
-	0, // 0: neuro.v1.IngestRequest.header:type_name -> neuro.v1.SessionHeader
-	1, // 1: neuro.v1.IngestRequest.batch:type_name -> neuro.v1.SampleBatch
-	2, // 2: neuro.v1.Ingest.Stream:input_type -> neuro.v1.IngestRequest
-	3, // 3: neuro.v1.Ingest.Stream:output_type -> neuro.v1.IngestSummary
-	3, // [3:4] is the sub-list for method output_type
-	2, // [2:3] is the sub-list for method input_type
-	2, // [2:2] is the sub-list for extension type_name
-	2, // [2:2] is the sub-list for extension extendee
-	0, // [0:2] is the sub-list for field type_name
+	2, // 0: neuro.v1.SampleBatch.markers:type_name -> neuro.v1.Marker
+	0, // 1: neuro.v1.IngestRequest.header:type_name -> neuro.v1.SessionHeader
+	1, // 2: neuro.v1.IngestRequest.batch:type_name -> neuro.v1.SampleBatch
+	3, // 3: neuro.v1.Ingest.Stream:input_type -> neuro.v1.IngestRequest
+	4, // 4: neuro.v1.Ingest.Stream:output_type -> neuro.v1.IngestSummary
+	4, // [4:5] is the sub-list for method output_type
+	3, // [3:4] is the sub-list for method input_type
+	3, // [3:3] is the sub-list for extension type_name
+	3, // [3:3] is the sub-list for extension extendee
+	0, // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_neuro_v1_ingest_proto_init() }
@@ -373,7 +451,7 @@ func file_neuro_v1_ingest_proto_init() {
 	if File_neuro_v1_ingest_proto != nil {
 		return
 	}
-	file_neuro_v1_ingest_proto_msgTypes[2].OneofWrappers = []any{
+	file_neuro_v1_ingest_proto_msgTypes[3].OneofWrappers = []any{
 		(*IngestRequest_Header)(nil),
 		(*IngestRequest_Batch)(nil),
 	}
@@ -383,7 +461,7 @@ func file_neuro_v1_ingest_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_neuro_v1_ingest_proto_rawDesc), len(file_neuro_v1_ingest_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   4,
+			NumMessages:   5,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

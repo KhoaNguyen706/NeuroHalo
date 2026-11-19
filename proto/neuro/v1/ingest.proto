@@ -20,6 +20,16 @@ message SampleBatch {
   int64 sent_time_unix_nanos = 4;      // wall clock when the sender sent it
   uint32 num_samples = 5;
   repeated float values = 6;           // num_samples x channels, row by row, microvolts
+  repeated Marker markers = 7;         // what happened during these samples; usually empty
+}
+
+// A marker says that something happened in the experiment at one sample: a
+// picture was shown, a task began. It travels inside the batch that holds its
+// sample, so it can never arrive out of order with the signal.
+message Marker {
+  uint64 sample_index = 1;             // position in the session, inside this batch
+  string label = 2;                    // as the experiment wrote it, e.g. "T1"
+  double duration_seconds = 3;         // how long it lasted; 0 for a single moment
 }
 
 message IngestRequest {
