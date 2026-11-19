@@ -59,11 +59,17 @@ type session struct {
 	alphaAbove int
 
 	// Artifacts (artifacts.go): the sensors above the eyes, scratch space for
-	// groupSwing, whether the last window held an eye movement, and how many
-	// windows in a row showed muscle activity.
+	// groupSwing, whether the last window held an eye movement, whether the
+	// next window is the first since the buffer filled, which sensors are on
+	// the front of the head and how many windows in a row each was excused
+	// for following the eyes, and how many windows in a row showed muscle
+	// activity.
 	frontPole  []int
 	eyeScratch []float64
 	eyeActive  bool
+	eyeFresh   bool
+	front      []bool
+	eyeExcused []int
 	muscleRun  int
 
 	// Epochs (epochs.go): the window and step sizes in samples, the analyzer
@@ -105,6 +111,9 @@ func newSession(id string, sampleRateHz float64, names []string, startedAt time.
 
 		frontPole:  frontPoleSensors(names),
 		eyeScratch: make([]float64, win),
+		eyeFresh:   true,
+		front:      make([]bool, n),
+		eyeExcused: make([]int, n),
 	}
 	s.initEpochs()
 	if links != nil {
@@ -116,6 +125,7 @@ func newSession(id string, sampleRateHz float64, names []string, startedAt time.
 		if eeg.BackOfHead(name) {
 			s.back = append(s.back, i)
 		}
+		s.front[i] = frontSensor(name)
 	}
 	return s
 }
@@ -146,6 +156,7 @@ func (s *session) add(b *neurov1.SampleBatch) batchResult {
 	if s.haveSeq && b.Seq != s.lastSeq+1 {
 		res.gap = true
 		s.pos, s.filled = 0, 0
+		s.eyeFresh = true
 		s.pending = nil
 	}
 	s.haveSeq, s.lastSeq = true, b.Seq
@@ -168,7 +179,11 @@ func (s *session) add(b *neurov1.SampleBatch) batchResult {
 			frame := s.compute(sampleCount/uint64(s.hop), b.SentTimeUnixNanos)
 			windowComputeSeconds.Observe(time.Since(began).Seconds())
 			res.frames = append(res.frames, frame)
-			eye, eyeSwing := s.eyeMovement()
+			span := s.hop
+			if s.eyeFresh {
+				span, s.eyeFresh = s.win, false
+			}
+			eye, eyeSwing := s.eyeMovement(span)
 			res.events = append(res.events, s.detect(frame, eye, eyeSwing)...)
 		}
 	}
@@ -265,7 +280,9 @@ func (s *session) markerEvents(list []marker) []*neurov1.Event {
 // detect turns one frame into events: a sensor going bad or recovering, a bad
 // sensor changing reason (noisy to flat, or back), alpha rising over the
 // back of the head, and the start of an eye movement or of muscle activity.
-// eye and eyeSwing come from eyeMovement for the same window.
+// eye and eyeSwing come from eyeMovement for the same window. A noisy window
+// of a front sensor that is not bad and whose signal follows the eyes is not
+// counted, and its quality in f is set to OK (see eyeExcuseWindows).
 func (s *session) detect(f *neurov1.FeatureFrame, eye bool, eyeSwing float64) []*neurov1.Event {
 	var events []*neurov1.Event
 	at := s.windowTime(f.WindowIndex).UnixNano()
@@ -296,7 +313,7 @@ func (s *session) detect(f *neurov1.FeatureFrame, eye bool, eyeSwing float64) []
 		}
 
 		if q == neurov1.Quality_QUALITY_OK {
-			s.badRun[c] = 0
+			s.badRun[c], s.eyeExcused[c] = 0, 0
 			if s.bad[c] && s.sameRun[c] >= recoveredAfterWindows {
 				s.bad[c] = false
 				emit("channel_recovered", s.names[c], map[string]any{"window": f.WindowIndex})
@@ -304,6 +321,15 @@ func (s *session) detect(f *neurov1.FeatureFrame, eye bool, eyeSwing float64) []
 			continue
 		}
 
+		if q == neurov1.Quality_QUALITY_NOISY && !s.bad[c] && s.front[c] && s.eyeExcused[c] < eyeExcuseWindows &&
+			s.followsEyes(c) {
+			// The eyes, not the sensor: the frame says OK too, so the head, the
+			// sensor map, the raw signal and the stored share of bad time do
+			// not show a blink as a bad sensor.
+			s.eyeExcused[c]++
+			f.Quality[c] = neurov1.Quality_QUALITY_OK
+			continue
+		}
 		s.badRun[c]++
 		switch {
 		case !s.bad[c] && s.badRun[c] >= badAfterWindows:

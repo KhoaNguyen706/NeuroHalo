@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"strings"
 
 	"github.com/neurohalo/neurohalo/internal/eeg"
 
@@ -28,6 +29,16 @@ const (
 	muscleAfterWindows = 2 // that many sensors for this many windows in a row -> muscle
 	muscleListed       = 8 // sensors named in the event's details
 	gammaIndex         = 4 // index of "gamma" in eeg.Bands
+
+	// A blink or eye movement swings the front of the head by hundreds of
+	// microvolts, past the noisy rule's 500 uV. A front sensor whose 2-second
+	// signal moves with the eyes (correlates at least eyeFollowMin with the
+	// other sensors right above the eyes) is not counted as noisy, for up to
+	// eyeExcuseWindows in a row (10 s); after that it is counted again. A
+	// broken sensor's noise does not follow the eyes, so it is still marked
+	// bad within badAfterWindows.
+	eyeFollowMin     = 0.7
+	eyeExcuseWindows = 20
 )
 
 // frontPoleSensors returns the indexes of the sensors right above the eyes.
@@ -42,13 +53,55 @@ func frontPoleSensors(names []string) []int {
 	return out
 }
 
+// frontSensor reports whether a sensor sits on the front half of the head,
+// where eye signals are large: names starting with Fp, AF or F (F, FC, FT).
+// Used by: newSession.
+func frontSensor(name string) bool {
+	return strings.HasPrefix(name, "F") || strings.HasPrefix(name, "AF")
+}
+
+// followsEyes reports whether sensor c's 2-second window moves with the eyes:
+// its correlation with the average of the frontal-pole sensors other than
+// itself is at least eyeFollowMin. It is false when no other frontal-pole
+// sensor exists. It reads the ring buffer, which must be full.
+// Used by: session.detect, for front sensors whose window is noisy.
+func (s *session) followsEyes(c int) bool {
+	var others []int
+	for _, f := range s.frontPole {
+		if f != c {
+			others = append(others, f)
+		}
+	}
+	if len(others) == 0 {
+		return false
+	}
+	var sx, sy, sxx, syy, sxy float64
+	n := float64(s.win)
+	for i := 0; i < s.win; i++ {
+		row := ((s.pos + i) % s.win) * s.channels
+		x := float64(s.ring[row+c])
+		var y float64
+		for _, f := range others {
+			y += float64(s.ring[row+f])
+		}
+		y /= float64(len(others))
+		sx, sy, sxx, syy, sxy = sx+x, sy+y, sxx+x*x, syy+y*y, sxy+x*y
+	}
+	cov := sxy - sx*sy/n
+	vx, vy := sxx-sx*sx/n, syy-sy*sy/n
+	if vx <= 0 || vy <= 0 {
+		return false
+	}
+	return cov/math.Sqrt(vx*vy) >= eyeFollowMin
+}
+
 // groupSwing returns the peak-to-peak, in microvolts, of the average of the
-// given sensors over the newest hop of samples, after a moving average of
+// given sensors over the newest span samples, after a moving average of
 // eyeSmoothSeconds. It reads the ring buffer, which must be full.
 // Used by: eyeMovement.
-func (s *session) groupSwing(sensors []int) float64 {
+func (s *session) groupSwing(sensors []int, span int) float64 {
 	k := max(1, int(math.Round(eyeSmoothSeconds*s.rate)))
-	n := s.hop + k - 1 // samples needed for one hop of smoothed values
+	n := span + k - 1 // samples needed for span smoothed values
 	if n > s.win {
 		n = s.win
 	}
@@ -74,16 +127,18 @@ func (s *session) groupSwing(sensors []int) float64 {
 	return hi - lo
 }
 
-// eyeMovement reports whether the newest 0.5 s holds a blink or eye movement,
-// and the size of the frontal swing in microvolts. It is false for a session
-// without frontal-pole or back-of-head sensors.
-// Used by: session.add, which passes the answer to detect.
-func (s *session) eyeMovement() (bool, float64) {
+// eyeMovement reports whether the newest span samples hold a blink or eye
+// movement, and the size of the frontal swing in microvolts. It is false for
+// a session without frontal-pole or back-of-head sensors.
+// Used by: session.add, which passes the answer to detect. It checks the
+// newest hop, or the whole window for the first window after the buffer
+// fills, whose older hops were never checked.
+func (s *session) eyeMovement(span int) (bool, float64) {
 	if len(s.frontPole) == 0 || len(s.back) == 0 {
 		return false, 0
 	}
-	front := s.groupSwing(s.frontPole)
-	return front > eyeMinMicrovolts && front > eyeFrontToBack*s.groupSwing(s.back), front
+	front := s.groupSwing(s.frontPole, span)
+	return front > eyeMinMicrovolts && front > eyeFrontToBack*s.groupSwing(s.back, span), front
 }
 
 // muscleSensors lists the sensors whose signal in this frame is mostly fast
