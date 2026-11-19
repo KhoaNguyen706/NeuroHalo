@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -37,11 +38,25 @@ type studyJSON struct {
 // studyDetailJSON is one study with its sessions.
 // Built by: getStudy.
 type studyDetailJSON struct {
-	ID          string        `json:"id"`
-	Name        string        `json:"name"`
-	CreatedAt   time.Time     `json:"createdAt"`
-	SessionList []sessionJSON `json:"sessionList"` // by participant, task, then start time
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	CreatedAt    time.Time         `json:"createdAt"`
+	SessionList  []sessionJSON     `json:"sessionList"`  // by participant, visit, task, then start time
+	Participants []participantJSON `json:"participants"` // only those with something entered
 }
+
+// participantJSON is what a study knows about one participant, for
+// participants.tsv. It is the body of PUT /studies/{id}/participants/{label}
+// (without the label) and part of studyDetailJSON.
+// Read by: setParticipant, readParticipants. Used by: getStudy, exportBIDS (bids.go).
+type participantJSON struct {
+	Label string `json:"label"`
+	Age   *int   `json:"age"` // in years; null when not given
+	Sex   string `json:"sex"` // "M", "F", "O", or "" when not given
+}
+
+// maxAge is the oldest age accepted, in years.
+const maxAge = 120
 
 // studyTagJSON is the body of PUT /sessions/{id}/study.
 // Read by: setSessionStudy.
@@ -49,6 +64,7 @@ type studyTagJSON struct {
 	StudyID     string `json:"studyId"` // "" takes the session out of its study
 	Participant string `json:"participant"`
 	Task        string `json:"task"`
+	Visit       string `json:"visit"` // optional: "" for none
 }
 
 // listStudies handles GET /studies: every study, newest first, with how many
@@ -116,7 +132,7 @@ func (a *api) getStudy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, err := a.db.Query(r.Context(),
-		sessionSelect+` WHERE s.study_id = $1 ORDER BY s.participant, s.task, s.started_at`, id)
+		sessionSelect+` WHERE s.study_id = $1 ORDER BY s.participant, s.visit, s.task, s.started_at`, id)
 	if err != nil {
 		serverError(w, r, err)
 		return
@@ -131,7 +147,67 @@ func (a *api) getStudy(w http.ResponseWriter, r *http.Request) {
 	if out.SessionList == nil {
 		out.SessionList = []sessionJSON{}
 	}
+	if out.Participants, err = a.readParticipants(r.Context(), id); err != nil {
+		serverError(w, r, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// readParticipants returns what the study knows about its participants,
+// ordered by label; never nil.
+// Used by: getStudy, exportBIDS (bids.go).
+func (a *api) readParticipants(ctx context.Context, studyID string) ([]participantJSON, error) {
+	rows, err := a.db.Query(ctx, `SELECT label, age, sex FROM participants WHERE study_id = $1 ORDER BY label`, studyID)
+	if err != nil {
+		return nil, err
+	}
+	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (participantJSON, error) {
+		var p participantJSON
+		err := row.Scan(&p.Label, &p.Age, &p.Sex)
+		return p, err
+	})
+	if out == nil {
+		out = []participantJSON{}
+	}
+	return out, err
+}
+
+// setParticipant handles PUT /studies/{id}/participants/{label} with
+// {"age": 24, "sex": "F"}: stores what the study knows about one participant,
+// for participants.tsv. null and "" clear a value. Answers the stored values.
+func (a *api) setParticipant(w http.ResponseWriter, r *http.Request) {
+	id, label := r.PathValue("id"), r.PathValue("label")
+	var body participantJSON
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, `the body must be {"age": number or null, "sex": "M", "F", "O" or ""}`)
+		return
+	}
+	switch {
+	case !bidsLabel.MatchString(label):
+		writeError(w, http.StatusBadRequest, "the participant must be 1 to 32 letters or digits")
+		return
+	case body.Age != nil && (*body.Age < 0 || *body.Age > maxAge):
+		writeError(w, http.StatusBadRequest, "the age must be 0 to 120 years")
+		return
+	case body.Sex != "" && body.Sex != "M" && body.Sex != "F" && body.Sex != "O":
+		writeError(w, http.StatusBadRequest, `sex must be "M", "F", "O" or ""`)
+		return
+	}
+	body.Label = label
+	_, err := a.db.Exec(r.Context(), `
+		INSERT INTO participants (study_id, label, age, sex) VALUES ($1, $2, $3, $4)
+		ON CONFLICT (study_id, label) DO UPDATE SET age = EXCLUDED.age, sex = EXCLUDED.sex`,
+		id, label, body.Age, body.Sex)
+	var pgErr *pgconn.PgError
+	switch {
+	case errors.As(err, &pgErr) && pgErr.Code == "23503": // foreign_key_violation
+		writeError(w, http.StatusNotFound, "no such study")
+	case err != nil:
+		serverError(w, r, err)
+	default:
+		writeJSON(w, http.StatusOK, body)
+	}
 }
 
 // deleteStudy handles DELETE /studies/{id}: removes the study. Its sessions
@@ -144,7 +220,7 @@ func (a *api) deleteStudy(w http.ResponseWriter, r *http.Request) {
 			`UPDATE sessions SET study_id = NULL, participant = '', task = '' WHERE study_id = $1`, id); err != nil {
 			return err
 		}
-		tag, err := tx.Exec(r.Context(), `DELETE FROM studies WHERE id = $1`, id)
+		tag, err := tx.Exec(r.Context(), `DELETE FROM studies WHERE id = $1`, id) // its participants go with it
 		deleted = tag.RowsAffected()
 		return err
 	})
@@ -159,7 +235,7 @@ func (a *api) deleteStudy(w http.ResponseWriter, r *http.Request) {
 }
 
 // setSessionStudy handles PUT /sessions/{id}/study with {"studyId",
-// "participant", "task"}: puts the session in a study with its tags, moves it
+// "participant", "task", "visit"} (visit optional): puts the session in a study with its tags, moves it
 // to another, or with "studyId": "" takes it out. Answers the updated session.
 func (a *api) setSessionStudy(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -170,17 +246,18 @@ func (a *api) setSessionStudy(w http.ResponseWriter, r *http.Request) {
 	}
 	var study *string
 	if body.StudyID == "" {
-		body.Participant, body.Task = "", ""
+		body.Participant, body.Task, body.Visit = "", "", ""
 	} else {
-		if !bidsLabel.MatchString(body.Participant) || !bidsLabel.MatchString(body.Task) {
-			writeError(w, http.StatusBadRequest, "participant and task must be 1 to 32 letters or digits (a BIDS rule: they become file names)")
+		if !bidsLabel.MatchString(body.Participant) || !bidsLabel.MatchString(body.Task) ||
+			(body.Visit != "" && !bidsLabel.MatchString(body.Visit)) {
+			writeError(w, http.StatusBadRequest, "participant, task and visit must be 1 to 32 letters or digits (a BIDS rule: they become file names)")
 			return
 		}
 		study = &body.StudyID
 	}
 	tag, err := a.db.Exec(r.Context(),
-		`UPDATE sessions SET study_id = $2, participant = $3, task = $4 WHERE id = $1`,
-		id, study, body.Participant, body.Task)
+		`UPDATE sessions SET study_id = $2, participant = $3, task = $4, visit = $5 WHERE id = $1`,
+		id, study, body.Participant, body.Task, body.Visit)
 	var pgErr *pgconn.PgError
 	switch {
 	case errors.As(err, &pgErr) && pgErr.Code == "23503": // foreign_key_violation

@@ -41,12 +41,14 @@ func TestBIDSMetadata(t *testing.T) {
 		{Participant: "02", Task: "rest", RateHz: 160, Seconds: 60, Channels: []string{"C3"}},
 	}
 	numberRuns(runs)
+	age := 31
 	files := map[string]string{}
-	for _, f := range bidsMetadata("Motor pilot", time.Unix(0, 0), runs, []string{"session s-x: its recording is not finished"}) {
+	for _, f := range bidsMetadata("Motor pilot", time.Unix(0, 0), runs, []string{"session s-x: its recording is not finished"},
+		[]participantJSON{{Label: "02", Age: &age, Sex: "F"}}) {
 		files[f.Path] = string(f.Body)
 	}
 	checks := map[string]string{
-		"participants.tsv": "participant_id\nsub-01\nsub-02\n",
+		"participants.tsv": "participant_id\tage\tsex\nsub-01\tn/a\tn/a\nsub-02\t31\tF\n",
 		"sub-01/eeg/sub-01_task-fists_channels.tsv": "name\ttype\tunits\tstatus\tstatus_description\n" +
 			"C3\tEEG\tµV\tgood\tn/a\nCz\tEEG\tµV\tgood\tn/a\na very long sens\tEEG\tµV\tgood\tn/a\n",
 		"sub-01/eeg/sub-01_task-fists_events.tsv": "onset\tduration\ttrial_type\tsample\n4.2\t4.2\tT1\t672\n8.4\t0\twith tab\t1344\n",
@@ -106,6 +108,39 @@ func TestSensorStatus(t *testing.T) {
 	for c, w := range want {
 		if got[c] != w {
 			t.Errorf("%s: %+v, want %+v", c, got[c], w)
+		}
+	}
+}
+
+// TestVisits checks the ses- level: a participant's visits get their own
+// folders and runs are numbered within each visit, and a session without a
+// visit is left out when the same participant has visits.
+func TestVisits(t *testing.T) {
+	t0 := time.Date(2026, 11, 16, 9, 0, 0, 0, time.UTC)
+	runs := []bidsRun{
+		{SessionID: "a", Participant: "01", Visit: "pre", Task: "rest", StartedAt: t0},
+		{SessionID: "b", Participant: "01", Visit: "post", Task: "rest", StartedAt: t0.Add(time.Hour)},
+		{SessionID: "c", Participant: "01", Visit: "post", Task: "rest", StartedAt: t0.Add(2 * time.Hour)},
+		{SessionID: "d", Participant: "01", Task: "rest", StartedAt: t0},
+		{SessionID: "e", Participant: "02", Task: "rest", StartedAt: t0},
+	}
+	kept, skipped := dropUnvisited(runs)
+	if len(skipped) != 1 || !strings.Contains(skipped[0], "session d ") {
+		t.Fatalf("skipped %v, want only session d", skipped)
+	}
+	numberRuns(kept)
+	want := []string{
+		"sub-01/ses-post/eeg/sub-01_ses-post_task-rest_run-1", // b
+		"sub-01/ses-post/eeg/sub-01_ses-post_task-rest_run-2", // c
+		"sub-01/ses-pre/eeg/sub-01_ses-pre_task-rest",         // a
+		"sub-02/eeg/sub-02_task-rest",                         // e
+	}
+	if len(kept) != len(want) {
+		t.Fatalf("%d runs kept, want %d", len(kept), len(want))
+	}
+	for i, r := range kept {
+		if r.prefix() != want[i] {
+			t.Errorf("run %d (%s): %s, want %s", i, r.SessionID, r.prefix(), want[i])
 		}
 	}
 }

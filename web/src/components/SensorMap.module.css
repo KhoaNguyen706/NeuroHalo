@@ -4,7 +4,9 @@
   position: absolute;
   top: 12px;
   right: 12px;
-  width: min(400px, 46%);
+  /* As tall as the 3D view allows and square, so it never reaches the charts below. */
+  height: min(400px, calc(100% - 24px));
+  max-width: 46%;
   aspect-ratio: 1;
   background: var(--overlay);
   border: 1px solid var(--line);

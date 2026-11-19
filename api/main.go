@@ -69,6 +69,11 @@ func main() {
 		hub:     newHub(),
 		origins: strings.Split(env("WEB_ORIGIN", "http://localhost:3000"), ","),
 	}
+	sum := newSummarizer()
+	a.summarizer = sum
+	if sum.client == nil {
+		log.Printf("ANTHROPIC_API_KEY is not set: session summaries are off (POST /sessions/{id}/summary answers 503)")
+	}
 	registerLiveMetrics(a)
 	metrics.Serve(env("METRICS_ADDR", ":9100"))
 

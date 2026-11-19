@@ -110,6 +110,7 @@ func (v *viewer) offerFrame(f *neurov1.FeatureFrame) bool {
 type hub struct {
 	mu            sync.Mutex
 	viewers       map[string]map[*viewer]struct{}
+	frames        frameClock // the newest frame of every session, for GET /live
 	framesDropped atomic.Uint64
 	eventsDropped atomic.Uint64
 	rawDropped    atomic.Uint64
@@ -151,8 +152,10 @@ func (h *hub) watchers(sessionID string) []*viewer {
 	return out
 }
 
-// publishFrame offers a frame to every viewer of its session.
+// publishFrame notes the frame's arrival for the overview and offers it to
+// every viewer of its session.
 func (h *hub) publishFrame(f *neurov1.FeatureFrame) {
+	h.frames.note(f.SessionId, f.WindowIndex, time.Now())
 	for _, v := range h.watchers(f.SessionId) {
 		if !v.offerFrame(f) {
 			h.framesDropped.Add(1)

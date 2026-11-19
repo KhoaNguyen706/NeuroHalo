@@ -29,7 +29,8 @@ import (
 //	<study>/
 //	  dataset_description.json   name and BIDS version
 //	  README                     what was exported, and what was left out
-//	  participants.tsv           one line per participant
+//	  participants.tsv           one line per participant, with age and sex when entered
+//	  participants.json          what those columns mean
 //	  task-rest_events.json      what the columns of events.tsv mean
 //	  sub-01/eeg/
 //	    sub-01_task-rest_eeg.edf       the recorder's EDF+ file, unchanged
@@ -40,7 +41,9 @@ import (
 //
 // Only sessions whose recording is ready are exported; the README names the
 // others. Several sessions of one participant and task get _run-1, _run-2...
-// in the order they started.
+// in the order they started. A participant recorded on several visits gets a
+// folder per visit, sub-01/ses-pre/eeg/sub-01_ses-pre_task-rest_eeg.edf, and
+// runs are numbered within each visit.
 
 // bidsVersion is the version of the BIDS specification the export follows.
 const bidsVersion = "1.10.0"
@@ -52,8 +55,9 @@ const bidsVersion = "1.10.0"
 type bidsRun struct {
 	SessionID   string
 	Participant string
+	Visit       string // "" when the participant has no visits
 	Task        string
-	Run         int // 0 when this is the participant's only session of the task
+	Run         int // 0 when this is the participant's only session of the task in this visit
 	RateHz      float64
 	Channels    []string
 	Seconds     float64 // the signal the EDF file holds
@@ -99,14 +103,17 @@ type bidsFile struct {
 	Body []byte
 }
 
-// numberRuns sorts runs by participant, task and start time, and numbers the
-// sessions of a participant and task that has more than one.
+// numberRuns sorts runs by participant, visit, task and start time, and
+// numbers the sessions of a participant, visit and task that has more than one.
 // Used by: exportBIDS.
 func numberRuns(runs []bidsRun) {
 	sort.SliceStable(runs, func(i, j int) bool {
 		a, b := runs[i], runs[j]
 		if a.Participant != b.Participant {
 			return a.Participant < b.Participant
+		}
+		if a.Visit != b.Visit {
+			return a.Visit < b.Visit
 		}
 		if a.Task != b.Task {
 			return a.Task < b.Task
@@ -115,7 +122,8 @@ func numberRuns(runs []bidsRun) {
 	})
 	for i := 0; i < len(runs); {
 		j := i
-		for j < len(runs) && runs[j].Participant == runs[i].Participant && runs[j].Task == runs[i].Task {
+		for j < len(runs) && runs[j].Participant == runs[i].Participant && runs[j].Visit == runs[i].Visit &&
+			runs[j].Task == runs[i].Task {
 			j++
 		}
 		for k := i; k < j; k++ {
@@ -129,13 +137,44 @@ func numberRuns(runs []bidsRun) {
 }
 
 // prefix is the start of every file name of the run, with its folder:
-// "sub-01/eeg/sub-01_task-rest_run-2".
+// "sub-01/eeg/sub-01_task-rest_run-2", or with a visit
+// "sub-01/ses-pre/eeg/sub-01_ses-pre_task-rest".
 func (r bidsRun) prefix() string {
-	name := "sub-" + r.Participant + "_task-" + r.Task
+	folder, name := "sub-"+r.Participant, "sub-"+r.Participant
+	if r.Visit != "" {
+		folder += "/ses-" + r.Visit
+		name += "_ses-" + r.Visit
+	}
+	name += "_task-" + r.Task
 	if r.Run > 0 {
 		name += "_run-" + strconv.Itoa(r.Run)
 	}
-	return "sub-" + r.Participant + "/eeg/" + name
+	return folder + "/eeg/" + name
+}
+
+// dropUnvisited leaves out the sessions without a visit of a participant who
+// has sessions with one: BIDS does not allow a participant's recordings to be
+// partly inside visit folders and partly outside. It returns the runs kept and
+// a README line for each one left out.
+// Used by: exportBIDS.
+func dropUnvisited(runs []bidsRun) ([]bidsRun, []string) {
+	hasVisits := map[string]bool{}
+	for _, r := range runs {
+		if r.Visit != "" {
+			hasVisits[r.Participant] = true
+		}
+	}
+	var kept []bidsRun
+	var skipped []string
+	for _, r := range runs {
+		if r.Visit == "" && hasVisits[r.Participant] {
+			skipped = append(skipped, fmt.Sprintf("session %s (participant %s, task %s): "+
+				"other sessions of this participant have a visit and this one has none", r.SessionID, r.Participant, r.Task))
+			continue
+		}
+		kept = append(kept, r)
+	}
+	return kept, skipped
 }
 
 // eegSidecar is the run's _eeg.json. The fields BIDS requires but NeuroHalo
@@ -279,11 +318,13 @@ func tsvField(s string) string {
 }
 
 // bidsMetadata builds every file of the dataset except the EDF files:
-// dataset_description.json, README, participants.tsv and each run's side
-// files. runs must already be numbered. skipped lists the sessions of the
-// study that were left out, with the reason, for the README.
+// dataset_description.json, README, participants.tsv and .json and each
+// run's side files. runs must already be numbered. skipped lists the sessions
+// of the study that were left out, with the reason, for the README. people
+// is what the study knows about its participants (age and sex); a
+// participant missing from it gets n/a.
 // Used by: exportBIDS.
-func bidsMetadata(study string, exported time.Time, runs []bidsRun, skipped []string) []bidsFile {
+func bidsMetadata(study string, exported time.Time, runs []bidsRun, skipped []string, people []participantJSON) []bidsFile {
 	description, _ := json.MarshalIndent(map[string]any{
 		"Name":        study,
 		"BIDSVersion": bidsVersion,
@@ -300,10 +341,18 @@ func bidsMetadata(study string, exported time.Time, runs []bidsRun, skipped []st
 			participants = append(participants, r.Participant) // runs are sorted by participant
 		}
 	}
+	known := map[string]participantJSON{}
+	for _, p := range people {
+		known[p.Label] = p
+	}
 	var tsv strings.Builder
-	tsv.WriteString("participant_id\n")
+	tsv.WriteString("participant_id\tage\tsex\n")
 	for _, p := range participants {
-		tsv.WriteString("sub-" + p + "\n")
+		age := "n/a"
+		if a := known[p].Age; a != nil {
+			age = strconv.Itoa(*a)
+		}
+		tsv.WriteString("sub-" + p + "\t" + age + "\t" + tsvField(known[p].Sex) + "\n")
 	}
 
 	var readme strings.Builder
@@ -316,7 +365,9 @@ func bidsMetadata(study string, exported time.Time, runs []bidsRun, skipped []st
 		"The reference sensor, the mains frequency and the amplifier's filters were not known to " +
 		"NeuroHalo and are given as n/a in each _eeg.json.\n\n" +
 		"While recording, NeuroHalo checks every sensor twice a second, over the last 2 seconds: flat " +
-		"(less than 0.5 uV of variation) or noisy (more than 500 uV peak to peak). In each channels.tsv, " +
+		"(less than 0.5 uV of variation) or noisy (more than 500 uV peak to peak). A sensor on the front of " +
+		"the head whose signal moves with the sensors above the eyes is carrying a blink or eye movement, " +
+		"not noise, and is not counted as noisy for up to 10 seconds at a time. In each channels.tsv, " +
 		"a sensor flagged for more than half of the recording has status \"bad\", and status_description " +
 		"says for how long and from when any sensor was flagged, so a stricter rule can be applied. " +
 		"The times are when the live check flagged it, up to about 3 seconds after the problem began.\n")
@@ -331,6 +382,7 @@ func bidsMetadata(study string, exported time.Time, runs []bidsRun, skipped []st
 		{"dataset_description.json", append(description, '\n')},
 		{"README", []byte(readme.String())},
 		{"participants.tsv", []byte(tsv.String())},
+		{"participants.json", participantsSidecar},
 	}
 	described := map[string]bool{} // tasks whose events.tsv columns are described
 	for _, r := range runs {
@@ -346,6 +398,24 @@ func bidsMetadata(study string, exported time.Time, runs []bidsRun, skipped []st
 	}
 	return files
 }
+
+// participantsSidecar describes the columns of participants.tsv.
+// Used by: bidsMetadata.
+var participantsSidecar = []byte(`{
+  "age": {
+    "Description": "Age of the participant",
+    "Units": "year"
+  },
+  "sex": {
+    "Description": "Sex of the participant, as entered in the study",
+    "Levels": {
+      "M": "male",
+      "F": "female",
+      "O": "other"
+    }
+  }
+}
+`)
 
 // eventsSidecar describes the columns of events.tsv. One copy at the top of
 // the dataset per task applies to every run of that task (BIDS inheritance).
@@ -402,7 +472,7 @@ func (a *api) exportBIDS(w http.ResponseWriter, r *http.Request) {
 	var skipped []string
 	byID := map[string]int{}
 	rows, err := a.db.Query(ctx, `
-		SELECT s.id, s.participant, s.task, s.sample_rate_hz, s.channel_names, s.started_at,
+		SELECT s.id, s.participant, s.visit, s.task, s.sample_rate_hz, s.channel_names, s.started_at,
 			COALESCE(rec.status, ''), COALESCE(rec.object_key, ''), COALESCE(rec.seconds, 0)
 		FROM sessions s LEFT JOIN recordings rec ON rec.session_id = s.id
 		WHERE s.study_id = $1`, id)
@@ -413,7 +483,7 @@ func (a *api) exportBIDS(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var run bidsRun
 		var status string
-		if err := rows.Scan(&run.SessionID, &run.Participant, &run.Task, &run.RateHz, &run.Channels,
+		if err := rows.Scan(&run.SessionID, &run.Participant, &run.Visit, &run.Task, &run.RateHz, &run.Channels,
 			&run.StartedAt, &status, &run.ObjectKey, &run.Seconds); err != nil {
 			rows.Close()
 			serverError(w, r, err)
@@ -437,11 +507,18 @@ func (a *api) exportBIDS(w http.ResponseWriter, r *http.Request) {
 		serverError(w, r, err)
 		return
 	}
+	runs, dropped := dropUnvisited(runs)
+	skipped = append(skipped, dropped...)
 	if len(runs) == 0 {
 		writeError(w, http.StatusConflict, "no session in this study has a finished recording yet")
 		return
 	}
 	numberRuns(runs)
+	people, err := a.readParticipants(ctx, id)
+	if err != nil {
+		serverError(w, r, err)
+		return
+	}
 	ids := make([]string, len(runs))
 	for i, run := range runs {
 		ids[i] = run.SessionID
@@ -515,7 +592,7 @@ func (a *api) exportBIDS(w http.ResponseWriter, r *http.Request) {
 		}
 		return f
 	}
-	for _, f := range bidsMetadata(study, now, runs, skipped) {
+	for _, f := range bidsMetadata(study, now, runs, skipped, people) {
 		if _, err := add(f.Path).Write(f.Body); err != nil {
 			abortDownload(id, err)
 		}

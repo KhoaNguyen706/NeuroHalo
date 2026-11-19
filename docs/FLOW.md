@@ -252,7 +252,7 @@ flowchart TD
 
 | Event | Rule in the code |
 | --- | --- |
-| `channel_bad` | A sensor that is not bad is non-OK for 3 windows in a row. It also fires again when a bad sensor's reason changes (noisy ↔ flat) for 3 windows in a row |
+| `channel_bad` | A sensor that is not bad is non-OK for 3 windows in a row. It also fires again when a bad sensor's reason changes (noisy ↔ flat) for 3 windows in a row. A noisy window of a front sensor that moves with the eyes is not counted (below) |
 | `channel_recovered` | A bad sensor is OK for 3 windows in a row |
 | `alpha_rise` | Mean back-of-head alpha is above 1.5 × the session's running average for 4 windows. It needs 10 windows of history first, and fires once per rise |
 | `eye_movement`, `muscle` | See "Eye movements and muscle activity" below |
@@ -311,7 +311,9 @@ flowchart TD
 | `GET /sessions/{id}/responses?band=` | `listResponses` | the session's epochs, averaged per marker label for one band (see "Averaged response") |
 | `GET /sessions/{id}/erp?reject=` | `getERP` | the voltage averaged per marker label, filtered and baselined, trials over `reject` µV left out per sensor (see "ERP") |
 | `GET /sessions/{id}/recording.edf` | `getRecording` | the recorder's EDF+ file (see "Recording") |
-| `PUT /sessions/{id}/study` | `setSessionStudy` | `{studyId, participant, task}` sets all three; `studyId: ""` takes the session out (see "Studies and BIDS") |
+| `PUT /sessions/{id}/study` | `setSessionStudy` | `{studyId, participant, task, visit}` sets them (visit optional); `studyId: ""` takes the session out (see "Studies and BIDS") |
+| `PUT /studies/{id}/participants/{label}` | `setParticipant` | `{age, sex}` for `participants.tsv`; `null` and `""` clear them |
+| `GET /live` | `liveOverview` | every live session with its data-quality summary (see "Live overview") |
 | `GET /studies`, `POST /studies` | `listStudies`, `createStudy` | every study with its session count; a new empty study |
 | `GET /studies/{id}`, `DELETE /studies/{id}` | `getStudy`, `deleteStudy` | the study with its sessions; deleting keeps the sessions, untagged |
 | `GET /studies/{id}/bids.zip` | `exportBIDS` | the study as a BIDS dataset, streamed as a zip |
@@ -712,15 +714,39 @@ flowchart LR
 
 `averageERP()` averages per label and reports, per sensor, how many trials were kept.
 
-**Data quality: the SME.** An average from 5 noisy trials and one from 50 clean ones can look alike; what differs is how much they would change with other trials. ERP researchers now report that as the SME (standardized measurement error, Luck et al. 2021): for a score such as "the mean voltage from 300 to 400 ms", the SME is that score's standard error over trials, the standard deviation of the trials' scores divided by the square root of their number. It is in µV, it shrinks as trials are added, and it grows when trials are noisy, so it answers "is this recording good enough yet?" while the participant is still there. `averageERP()` gives the SME of the mean voltage in each 100 ms bin, ERPLAB's default, from the trials kept for each sensor (−1 below 2 trials). The chart draws each as a thin bar of one SME above and below the bin's mean, and the line's label ends with one number, "±12.3 µV": the root mean square of the SMEs of the bins after the marker, as ERPLAB summarises them. No high-pass filter is applied: a 0.1 Hz high-pass needs about 30 seconds of signal, and the baseline removes the drift within each 1-second trial. Computing on request, not in the processor, keeps the threshold a choice made while looking at the data, as it is in ERPLAB.
+**Data quality: the SME.** An average from 5 noisy trials and one from 50 clean ones can look alike; what differs is how much they would change with other trials. ERP researchers now report that as the SME (standardized measurement error, Luck et al. 2021): for a score such as "the mean voltage from 300 to 400 ms", the SME is that score's standard error over trials, the standard deviation of the trials' scores divided by the square root of their number. It is in µV, it shrinks as trials are added, and it grows when trials are noisy, so it answers "is this recording good enough yet?" while the participant is still there. `averageERP()` gives the SME of the mean voltage in each 100 ms window, from the trials kept for each sensor (−1 below 2 trials). `smeWindows()` lays the windows out exactly as ERPLAB's `make_DQ_spec` and `sme_analytic` do: lined up on the marker (−200 to −100 ms, −100 to 0, 0 to 100, … 700 to 800), each from the sample nearest its start to the sample nearest its end, **both included**, so the sample on a boundary counts in both windows next to it. (Until 2026-11-16 the windows were half-open; reading ERPLAB's code for the cross-check below showed the difference.) The chart draws each as a thin bar of one SME above and below the bin's mean, and the line's label ends with one number, "±12.3 µV": the root mean square of the SMEs of the bins after the marker, as ERPLAB summarises them. No high-pass filter is applied: a 0.1 Hz high-pass needs about 30 seconds of signal, and the baseline removes the drift within each 1-second trial. Computing on request, not in the processor, keeps the threshold a choice made while looking at the data, as it is in ERPLAB.
 
 **Web.** "ERP" in the rail, once the session has a marker. The chart shows one line per label for the highlighted sensor, or Cz, in µV from −200 to +800 ms. The header switches the threshold between 100 µV, 200 µV and keeping all trials, and each line's label reads "T1 · 5/8": trials kept for this sensor, of all the label's trials. A label with none kept shows "0/8" and no line.
 
 Checked on 2026-11-15 with `replayer/check_erp.py`, which uses MNE only: it filters the original file with `raw.filter(None, 30)`, cuts the trials with `mne.Epochs(tmin=-0.2, tmax=0.8, baseline=(None, 0))` and applies the same per-sensor rejection. "Left and right fist" replayed whole: the same 29 trials, the same trials kept per sensor at 100 µV, 200 µV and none, every averaged sample of 64 sensors and 3 labels within 0.00002 µV, and every bin's SME (recomputed with NumPy from the MNE epochs) within 0.00001 µV.
 
+Checked again on 2026-11-16 against ERPLAB itself with `replayer/check_erplab.py`. ERPLAB is MATLAB code; the script runs ERPLAB 13.10 on EEGLAB 2025.1 in GNU Octave 9.2 (the `gnuoctave/octave` Docker image), so nothing is installed. It hands ERPLAB the recording already filtered as above, and `replayer/erplab_erp.m` does the rest with ERPLAB's own functions: `pop_creabasiceventlist`, `pop_binlister` (one bin per label), `pop_epochbin` with baseline `'pre'`, `pop_averager` with data quality on, and for rejection `pop_artmwppth` with one window over the whole trial, run once per sensor so trials are left out per sensor. Same "Left and right fist" replay: the same 14, 8 and 7 trials per label, the same trials kept per sensor at 200 µV, every averaged sample within 0.00004 µV and every aSME window within 0.00002 µV, with every trial kept and at 200 µV. Four functions are replaced by empty or Octave-safe versions, none of which touch the data (DIPFIT's `dipfitdefs`, missing from the release zip; ERPLAB's command history; a Java call for the user's home folder; ERPLAB's `ismember` wrapper). Two differences turned up on the way: ERPLAB's SME windows include both end samples (NeuroHalo's did not, and now does), and EEGLAB's epochs leave out their end point, so the check asks ERPLAB for one sample past 800 ms.
+
 What the check also showed: this sample is far too noisy for the usual 100 µV threshold. After the 30 Hz filter the median trial swings 207 µV peak to peak, and 400 µV over the forehead. At 100 µV Cz keeps no trial at all; at 200 µV it keeps 1 of 8 left-fist trials. The rule is doing its job: these recordings (BCI2000, 2004) were made for movement studies, which look at rhythms, not ERPs. A recording made for ERPs, with a good amplifier and a still participant, keeps most of its trials at 100 µV.
 
-Limits: rejection is per sensor, so different sensors can average different trials (MNE and ERPLAB usually drop the whole trial when any sensor fails; the chart's counts show the difference); the window, the 30 Hz filter and the 100 ms bins are fixed; there is no "trials still needed" yet, because that needs a target SME, which depends on the effect a study looks for; no statistics are computed. The raw stretch grows with sample rate and sensor count, and an `Epoch` must stay under Kafka's 1 MB message limit: about 0.5 MB at 1,000 Hz with 64 sensors, but too close at 2,000 Hz or with 128 sensors at 1,000 Hz.
+**Trials still needed.** A lab decides how precise its averages must be, as an SME in µV (it depends on the effect the study looks for), so the chart header offers a target: ±1, ±2 or ±5 µV, or none. With one chosen, each line's label goes on with "· 140 more" or "· enough" (`trialsStillNeeded()` in `web/src/lib/sme.ts`). An SME falls with the square root of the trials, so a line with `n` kept trials and SME `s` reaches target `t` at about `n × (s/t)²` kept trials; the trials still to come are scaled up by the share rejected so far, because the new ones will be rejected as often. The SME used is the line's root mean square over the windows after the marker, the number already in its label. It is an estimate: the real SME moves as trials come in.
+
+When a chart has no line yet, it says why in the middle of the plot (for the ERP: "No trial under 100 µV at Cz yet. Try 200 µV"), instead of showing bare axes.
+
+Limits: rejection is per sensor, so different sensors can average different trials (MNE and ERPLAB usually drop the whole trial when any sensor fails; the chart's counts show the difference); the window, the 30 Hz filter and the 100 ms windows are fixed; no statistics are computed. The raw stretch grows with sample rate and sensor count, and an `Epoch` must stay under Kafka's 1 MB message limit: about 0.5 MB at 1,000 Hz with 64 sensors, but too close at 2,000 Hz or with 128 sensors at 1,000 Hz.
+
+# Live overview
+
+A lab may record in several rooms at once, and one person watches them. `GET /live` (`api/overview.go`, `liveOverview()`) returns every live session with what decides whether its recording will be usable:
+
+| Field | From |
+| --- | --- |
+| participant, task, study | the session row |
+| `seconds` of signal so far | the newest frame's window number × 0.5 s, on the recording's own clock |
+| `lastFrameMs`, `stalled` | `frameClock`: the live consumer notes each frame's arrival time as it hands it to the hub, so whether data is still arriving is known to the half second without the database. `stalled` after 3 s without a frame |
+| `bad` sensors | the events table: sensors whose latest `channel_bad` or `channel_recovered` is `channel_bad` (`DISTINCT ON (channel) … ORDER BY at DESC`) |
+| `trials`, `eye`, `muscle` | counts of `marker`, `eye_movement` and `muscle` events |
+
+All of it comes from one query per request (`liveOverviewQuery`, two `LATERAL` subqueries per session), plus the in-memory frame clock. Counts come from Postgres, so they lag the live view by the event writer's flush, about a second. After an api restart the frame clock is empty until the next frame, half a second later; `forget()` drops ended sessions from it on every request.
+
+The page (`web/src/app/live/page.tsx`, "Live" in the home page's top bar) asks every 2 seconds and shows one row per session: name, participant and task, time, "arriving" or "stopped 12 s" in red, bad sensors in red ("2 of 64: Cz, PO8"), trials, and eye movements and muscle activity per minute once 30 s of signal are in.
+
+Checked on 2026-11-16 with three real-time replays: the "Cz fails" sample showed "2 of 64: Cz, PO8" after 23 s, and pausing the replay worker container (`docker compose pause worker`, a dropped amplifier as far as the pipeline can tell) turned all three rows to "stopped" within 3 seconds.
 
 # Eye movements and muscle activity
 
@@ -731,7 +757,11 @@ Limits: rejection is per sensor, so different sensors can average different tria
 | `eye_movement` | The average of `Fp1`, `Fp2` and `Fpz`, smoothed over 0.1 s, swings more than 100 µV within the newest 0.5 s, and at least 3 times as much as the back of the head does |
 | `muscle` | Gamma (30 to 45 Hz) is above 30% of a sensor's power on at least 3 good sensors, for 2 windows in a row |
 
-The 0.1-second smoothing also removes mains hum, which is strong in the sample recordings. The thresholds were set on those recordings (eyes open: 8 eye events a minute; eyes closed: 3 to 6, since eyes also move under closed lids). They are rules of thumb and have not been checked against hand-labelled data. The session page lists both events in the rail; they get no tick on the chart.
+The 0.1-second smoothing also removes mains hum, which is strong in the sample recordings. The thresholds were set on those recordings (eyes open: 8 eye events a minute; eyes closed: 3 to 6, since eyes also move under closed lids). They are rules of thumb and have not been checked against hand-labelled data. The session page lists both events in the rail; they get no tick on the chart. The first window after the 2-second buffer fills checks its whole 2 seconds, not only the newest 0.5 s, so a blink before the first window is not missed.
+
+**Eyes are not a bad sensor.** A blink or eye movement swings the front of the head by 400 to 1,000 µV for about a second in the sample recordings, past the noisy rule's 500 µV, and spreads from `Fp1`/`Fp2` back over the `AF`, `F`, `FC` and `FT` rows. Labs keep those sensors and remove the eyes later (for example with ICA), so marking them bad was wrong. `detect()` therefore skips a noisy window of a front sensor (`frontSensor`: names starting with `F` or `AF`) when `followsEyes()` says the sensor's 2-second signal correlates at least 0.7 with the average of the other frontal-pole sensors: it carries the eye signal. A broken sensor's noise does not follow the other sensors, so it is still marked bad within 3 windows. The skip lasts at most 20 windows in a row (10 s); a "blink" that never stops is counted again. A skipped window's quality is also set to OK in the frame itself, so the head, the sensor map, the raw signal, the rail's "64 of 64 sensors OK" and the stored share of bad time do not show a blink as a bad sensor either (until 2026-11-17 only the events skipped it, and every blink still flashed red rings on the forehead). A sensor already marked bad is not skipped, so it cannot look OK while it is bad. The 0.5-second `eye_movement` rule was not used for this, because on the samples it misses many of these slow swings: the back of the head drifts too, and the 3-times rule fails.
+
+Measured by replaying the four samples before and after (`channel_bad` events): "Eyes open" went from 23 to 1 (`T7` at 40 s), "Left and right fist" from 41 to 2 (`C3`, `C5` at 72 s); "Eyes closed" kept its 5 back-of-head flags (`O1`, `O2`, `PO8`), which are not eye-related and were there before; "Cz fails" still marks `Cz` flat at 23 s.
 
 # Recording
 
@@ -780,7 +810,8 @@ A lab does not want 40 loose sessions; it wants "participant 07, resting task, s
 | --- | --- |
 | `dataset_description.json` | the study's name, BIDS version 1.10.0, "generated by NeuroHalo" |
 | `README` | what was exported, how the EDF files were made, and what was left out |
-| `participants.tsv` | one `sub-<label>` per participant |
+| `participants.tsv` | one `sub-<label>` per participant, with `age` and `sex` (`n/a` when not entered) |
+| `participants.json` | what `age` (years) and `sex` (M, F, O) mean |
 | `task-<task>_events.json` | what the `trial_type` and `sample` columns mean; one per task, inherited by every run of it |
 | `sub-<p>/eeg/..._eeg.json` | task, sample rate, sensor count, duration. Reference, mains frequency and amplifier filters are `n/a`: NeuroHalo is not told them |
 | `..._channels.tsv` | every sensor as `EEG`, `µV`, under the name the EDF header gives it (`recording.EDFLabel`, shared with the recorder: printable ASCII, 16 characters), with `status` and `status_description` from the live check (below) |
@@ -789,7 +820,11 @@ A lab does not want 40 loose sessions; it wants "participant 07, resting task, s
 
 The zip is written straight into the response, the EDF files streamed from file storage one after another, so a large study never sits in memory. If file storage fails half-way, `abortDownload()` cuts the connection, so the browser reports a failed download rather than saving a broken zip. A link cannot send a header, so this path takes the token as `?token=`, like the EDF download.
 
-**Web (`web/src/app/studies/`).** "Studies" in the home page's top bar lists the studies. A study's page shows its sessions with participant, task, the file name each will get (computed the same way as `numberRuns()`), the recorded length and the recording's state; it reloads every 3 seconds while a file is still being written. Below, a session outside any study can be added with a participant and task, which stay filled for the next run.
+**Visits and participants.** A session can also carry a visit (`sessions.visit`, letters and digits, optional), for a participant recorded on several days. Its files then go in a visit folder, `sub-01/ses-pre/eeg/sub-01_ses-pre_task-rest_eeg.edf`, and runs are numbered within each visit. BIDS does not allow a participant's recordings to be partly in visit folders and partly outside, so `dropUnvisited()` leaves out a session without a visit when the same participant has visits, and the README says so. Age and sex live in the `participants` table, one row per study and participant label, written by `PUT /studies/{id}/participants/{label}`; `readParticipants()` feeds them to `participants.tsv`.
+
+**Web (`web/src/app/studies/`).** "Studies" in the home page's top bar lists the studies. A study's page shows its sessions with participant, visit, task, the file name each will get (computed the same way as `dropUnvisited()` and `numberRuns()`), the recorded length and the recording's state; it reloads every 3 seconds while a file is still being written. A "Participants" table takes each participant's age (saved when the field is left) and sex. Below, a session outside any study can be added with a participant, task and optional visit, which stay filled for the next run.
+
+Checked on 2026-11-16 on a study with visits: participant 01 with a "pre" visit and two runs of a "post" visit plus one session without a visit, and participant 02 without visits. The session without a visit was left out and named in the README; the BIDS validator 3.0.2 reported no errors (the same authors and recommended-field warnings as before); MNE-BIDS found sessions `post` and `pre`, runs 1 and 2 of `post`, and read participant 01 as female, 24.
 
 Checked on 2026-11-14 on a study of 4 recordings (two "fist" runs of participant 01, rest for 02 and 03) plus one session still recording. The official BIDS validator 3.0.2 reported no errors; its warnings ask for authors, equipment software versions and HED tags, which only the lab knows. MNE-BIDS read every recording back: 3 participants, 2 tasks, 64 sensors at 160 Hz each, and all 30 markers per fist run. The session still recording was left out and named in the README.
 
@@ -799,7 +834,9 @@ Checked on 2026-11-14 with the sample where Cz fails at 20 s: Cz came out `bad`,
 
 A caution found on the same run: in the "Left and right fist" recordings the forehead sensors Fp1, Fp2, AF7 and AF3 come out `bad`, noisy for 51 to 63% of the time. They sit above the eyes, so this is almost certainly blinking at each cue, not a broken sensor. Labs usually keep those sensors and remove blinks later (for example with ICA). The noisy rule (500 µV peak to peak) cannot tell the two apart yet.
 
-Limits: no session level (`ses-`), so a participant's visits on different days become runs of one session; every sensor is typed EEG, even an eye or heart channel; nothing about the participants (age, sex) is collected; and the bad-sensor status mistakes heavy blinking for a noisy sensor, as above.
+Limits: every sensor is typed EEG, even an eye or heart channel; only age and sex are collected about participants; and no `sessions.tsv` or `scans.tsv` (dates of each visit) is written.
+
+The caution above was fixed on 2026-11-16 (see "Eyes are not a bad sensor"): the forehead sensors of "Left and right fist" are no longer flagged.
 
 # Not built yet
 

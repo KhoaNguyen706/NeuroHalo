@@ -24,7 +24,8 @@ import (
 // Used by: routes, cors, requireToken, listSessions, getSession, listEvents,
 // listRollups, sessionExists (http.go); listResponses (responses.go); liveSession (live.go); listSamples,
 // playSample, upload, getReplay, queueReplay (uploads.go); getRecording, removeRecording (recordings.go);
-// listStudies, createStudy, getStudy, deleteStudy, setSessionStudy (studies.go); exportBIDS (bids.go).
+// listStudies, createStudy, getStudy, deleteStudy, setSessionStudy, setParticipant (studies.go); exportBIDS (bids.go);
+// liveOverview (overview.go); getFacts, getSummary, createSummary (summary.go).
 type api struct {
 	db        *pgxpool.Pool
 	token     string
@@ -32,11 +33,12 @@ type api struct {
 	objects   *objectStore // nil when uploads are not configured
 	origins   []string     // web app origins allowed by CORS and the WebSocket
 	wsClients atomic.Int64
+	summarizer summarizer // writes session summaries (Claude)
 }
 
 // sessionJSON is one session as the REST endpoints return it.
 // Filled by: scanSession.
-// Used by: listSessions, getSession, getStudy (studies.go).
+// Used by: listSessions, getSession, getStudy (studies.go), liveOverview (overview.go), sessionFacts (summary.go).
 type sessionJSON struct {
 	ID           string     `json:"id"`
 	Label        string     `json:"label"` // sample title or uploaded file name; empty for hand-run replays
@@ -53,6 +55,7 @@ type sessionJSON struct {
 	StudyID     string `json:"studyId"`
 	Participant string `json:"participant"`
 	Task        string `json:"task"`
+	Visit       string `json:"visit"` // "" unless the participant is recorded on several visits
 }
 
 // eventJSON is one stored event.
@@ -73,22 +76,32 @@ type rollupJSON struct {
 	Frames      int       `json:"frames"`
 }
 
-// sessionSelect reads sessions with the label of the replay that started them,
-// the state of their recording and their study tags.
-const sessionSelect = `SELECT s.id, COALESCE(r.label, ''), s.source, s.sample_rate_hz, s.channel_names,
+// sessionColumns and sessionFrom read sessions with the label of the replay
+// that started them, the state of their recording and their study tags, in
+// the order scanSession expects. sessionSelect is the two together; the live
+// overview adds its own columns and joins between them.
+const (
+	sessionColumns = `s.id, COALESCE(r.label, ''), s.source, s.sample_rate_hz, s.channel_names,
 	s.started_at, s.ended_at, s.status, rec.status, rec.bytes, rec.seconds,
-	COALESCE(s.study_id, ''), s.participant, s.task
+	COALESCE(s.study_id, ''), s.participant, s.task, s.visit`
+	sessionFrom = `
 	FROM sessions s LEFT JOIN replays r ON r.session_id = s.id
 	LEFT JOIN recordings rec ON rec.session_id = s.id`
+	sessionSelect = `SELECT ` + sessionColumns + sessionFrom
+)
 
 // routes returns the HTTP handler: CORS outside, then the bearer token, then
 // the endpoints.
 func (a *api) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /sessions", a.listSessions)
+	mux.HandleFunc("GET /live", a.liveOverview)
 	mux.HandleFunc("GET /sessions/{id}", a.getSession)
 	mux.HandleFunc("DELETE /sessions/{id}", a.deleteSession)
 	mux.HandleFunc("GET /sessions/{id}/events", a.listEvents)
+	mux.HandleFunc("GET /sessions/{id}/facts", a.getFacts)
+	mux.HandleFunc("GET /sessions/{id}/summary", a.getSummary)
+	mux.HandleFunc("POST /sessions/{id}/summary", a.createSummary)
 	mux.HandleFunc("GET /sessions/{id}/rollups", a.listRollups)
 	mux.HandleFunc("GET /sessions/{id}/responses", a.listResponses)
 	mux.HandleFunc("GET /sessions/{id}/erp", a.getERP)
@@ -100,6 +113,7 @@ func (a *api) routes() http.Handler {
 	mux.HandleFunc("GET /replays/{id}", a.getReplay)
 	mux.HandleFunc("POST /sessions/{id}/replay", a.replayFrom)
 	mux.HandleFunc("PUT /sessions/{id}/study", a.setSessionStudy)
+	mux.HandleFunc("PUT /studies/{id}/participants/{label}", a.setParticipant)
 	mux.HandleFunc("GET /studies", a.listStudies)
 	mux.HandleFunc("POST /studies", a.createStudy)
 	mux.HandleFunc("GET /studies/{id}", a.getStudy)
@@ -175,14 +189,15 @@ func serverError(w http.ResponseWriter, r *http.Request, err error) {
 	writeError(w, http.StatusInternalServerError, "internal error")
 }
 
-// scanSession reads one row selected with sessionSelect.
-func scanSession(row pgx.Row) (sessionJSON, error) {
+// scanSession reads one row selected with sessionColumns, then any extra
+// columns after them into extra.
+func scanSession(row pgx.Row, extra ...any) (sessionJSON, error) {
 	var s sessionJSON
 	var recStatus *string
 	var recBytes *int64
 	var recSeconds *float64
-	err := row.Scan(&s.ID, &s.Label, &s.Source, &s.SampleRateHz, &s.ChannelNames, &s.StartedAt, &s.EndedAt, &s.Status,
-		&recStatus, &recBytes, &recSeconds, &s.StudyID, &s.Participant, &s.Task)
+	err := row.Scan(append([]any{&s.ID, &s.Label, &s.Source, &s.SampleRateHz, &s.ChannelNames, &s.StartedAt, &s.EndedAt, &s.Status,
+		&recStatus, &recBytes, &recSeconds, &s.StudyID, &s.Participant, &s.Task, &s.Visit}, extra...)...)
 	if err == nil && recStatus != nil {
 		s.Recording = &recordingJSON{Status: *recStatus, Bytes: *recBytes, Seconds: *recSeconds}
 	}

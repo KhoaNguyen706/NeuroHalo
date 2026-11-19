@@ -17,17 +17,39 @@
 }
 
 .main {
-  display: flex; /* the head fills what the chart under it leaves */
+  display: flex; /* the head fills what the charts under it leave */
   flex-direction: column;
   min-width: 0;
   min-height: 0;
+  overflow-y: auto; /* with several charts open, the column scrolls instead of squeezing the head */
+}
+
+/* The charts keep their own height; only the head grows and shrinks. */
+.main > * {
+  flex-shrink: 0;
 }
 
 .stage {
-  flex: 1;
-  position: relative; /* the top-left text and the popover are placed inside it */
+  flex: 1 0 380px; /* never smaller than this, so the head and the sensor map stay readable */
+  position: relative; /* the top-left text, the sensor map and the popover are placed inside it */
   min-width: 0;
-  min-height: 0;
+  container-type: size; /* .sceneBeside measures the sensor map from the stage's size */
+}
+
+/* The 3D view. With the sensor map open it ends where the map begins, so the
+   head is centred in the space left and the map never covers it. The map's
+   width is worked out as in SensorMap.module.css: min(400px, height - 24px,
+   46% of the width), plus its 12px margin and 12px of air. On a phone the
+   head keeps the full width; the map sits over it there. */
+.scene {
+  position: absolute;
+  inset: 0;
+}
+
+@media (min-width: 801px) {
+  .sceneBeside {
+    right: calc(min(400px, 100cqh - 24px, 46cqw) + 24px);
+  }
 }
 
 .info {
@@ -172,6 +194,12 @@
 
 /* The chart's line choice (All, Regions, Left / right) and the exports (two
    CSV files and the recording): small text buttons, accent when chosen. */
+/* The ERP chart's two button groups: rejection and target SME. */
+.controlGroups {
+  display: flex;
+  gap: 28px;
+}
+
 .modes,
 .exports {
   display: flex;

@@ -93,6 +93,7 @@ export default function HomePage() {
       <Link href="/" className="brand"><span className="brand-ring" aria-hidden />NeuroHalo</Link>
       <span className="bar-end">
         <span className="bar-note">EEG replay · research and education only, not for diagnosis</span>
+        <Link href="/live" className="bar-link">Live</Link>
         <Link href="/studies" className="bar-link">Studies</Link>
         <ThemeToggle />
       </span>

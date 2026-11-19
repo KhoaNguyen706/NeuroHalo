@@ -41,7 +41,7 @@ func erpRows(label string, n int, f func(row int) float64) voltageRow {
 func TestAverageERP(t *testing.T) {
 	// A 1-tap kernel keeps the arithmetic visible: rows 2..6, marker at row 4,
 	// baseline rows 2..4.
-	sh := erpShape{channels: 1, pre: 4, from: 2, to: 6, baseline: 3, kernel: []float64{1}, bins: []int{0, 0, 0, 1, 1}, numBins: 2}
+	sh := erpShape{channels: 1, pre: 4, from: 2, to: 6, baseline: 3, kernel: []float64{1}, binFirst: []int{0, 2}, binLast: []int{2, 4}}
 	step := func(row int) float64 { // 10 µV before the marker, 40 µV from the row after it
 		if row > 4 {
 			return 40
@@ -81,29 +81,49 @@ func TestAverageERP(t *testing.T) {
 	}
 }
 
-// Two trials whose bin means after the marker are 10 and 20 µV: their sample
-// standard deviation is 7.07 µV, so the SME is 7.07 / sqrt(2) = 5 µV.
+// Two trials whose window means after the marker are 10 and 20 µV: their
+// sample standard deviation is 7.07 µV, so the SME is 7.07 / sqrt(2) = 5 µV.
+// Row 2 is on the boundary, so as in ERPLAB it also counts in the first
+// window: means 10/3 and 20/3, an SME of 5/3 µV.
 func TestERPSME(t *testing.T) {
-	sh := erpShape{channels: 1, pre: 1, from: 0, to: 3, baseline: 2, kernel: []float64{1}, bins: []int{0, 0, 1, 1}, numBins: 2}
+	sh := erpShape{channels: 1, pre: 1, from: 0, to: 3, baseline: 2, kernel: []float64{1}, binFirst: []int{0, 2}, binLast: []int{2, 3}}
 	rows := []voltageRow{
 		erpRows("cue", 4, func(row int) float64 { return []float64{0, 0, 10, 10}[row] }),
 		erpRows("cue", 4, func(row int) float64 { return []float64{0, 0, 20, 20}[row] }),
 	}
 	got := averageERP(rows, sh, 0)[0]
-	if math.Abs(float64(got.SME[1])-5) > 1e-6 || got.SME[0] != 0 {
-		t.Errorf("SME %v, want [0 5]", got.SME)
+	if math.Abs(float64(got.SME[1])-5) > 1e-6 || math.Abs(float64(got.SME[0])-5.0/3) > 1e-6 {
+		t.Errorf("SME %v, want [1.667 5]", got.SME)
 	}
 }
 
-func TestBinsOf(t *testing.T) {
-	// 160 Hz from -0.2 to 0.8 s: 10 bins of 16 samples, the last sample in the last bin.
+func TestSMEWindows(t *testing.T) {
+	// 160 Hz from -0.2 to 0.8 s: ERPLAB's 10 windows, -200 to -100 ms up to
+	// 700 to 800 ms, each 17 samples, sharing the sample on each boundary.
 	var times []float64
 	for i := -32; i <= 128; i++ {
 		times = append(times, float64(i)/160)
 	}
-	bins, n := binsOf(times)
-	if n != 10 || bins[0] != 0 || bins[15] != 0 || bins[16] != 1 || bins[159] != 9 || bins[160] != 9 {
-		t.Errorf("%d bins; bins of samples 0, 15, 16, 159, 160: %d %d %d %d %d", n, bins[0], bins[15], bins[16], bins[159], bins[160])
+	starts, first, last := smeWindows(times)
+	if len(starts) != 10 || math.Abs(starts[0]+0.2) > 1e-9 || math.Abs(starts[9]-0.7) > 1e-9 {
+		t.Fatalf("starts %v", starts)
+	}
+	if first[0] != 0 || last[0] != 16 || first[1] != 16 || first[9] != 144 || last[9] != 160 {
+		t.Errorf("first %v last %v", first, last)
+	}
+
+	// 256 Hz from -51 to 204 samples: -0.199 s is after -200 ms, so ERPLAB
+	// starts at -100 ms; the 700 ms window would end after 0.797 s and is dropped.
+	times = times[:0]
+	for i := -51; i <= 204; i++ {
+		times = append(times, float64(i)/256)
+	}
+	starts, first, last = smeWindows(times)
+	if len(starts) != 8 || math.Abs(starts[0]+0.1) > 1e-9 || math.Abs(starts[7]-0.6) > 1e-9 {
+		t.Fatalf("256 Hz starts %v", starts)
+	}
+	if times[first[0]] > -0.098 || times[first[0]] < -0.102 || times[last[7]] < 0.698 || times[last[7]] > 0.702 {
+		t.Errorf("256 Hz: first window from %.4f, last to %.4f", times[first[0]], times[last[7]])
 	}
 }
 

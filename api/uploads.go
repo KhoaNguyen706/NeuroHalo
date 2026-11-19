@@ -159,6 +159,7 @@ func replaySeconds(r *http.Request, name string) (float64, bool) {
 }
 
 // clockText formats seconds as m:ss for a session label.
+// Used by: replayFrom, factsText (summary.go).
 func clockText(seconds float64) string {
 	return fmt.Sprintf("%d:%02d", int(seconds)/60, int(seconds)%60)
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"math"
 	"net/http"
@@ -30,7 +31,10 @@ import (
 //
 // Next to the average, it reports how precise the average is: the SME
 // (standardized measurement error, Luck et al. 2021) of the mean voltage in
-// each 100 ms bin, as ERPLAB computes it by default. The SME is the standard
+// each 100 ms window, as ERPLAB computes it by default (its make_DQ_spec and
+// sme_analytic): windows lined up on the marker, each taking every sample from
+// its start to its end inclusive, so a sample on a boundary counts in both
+// windows next to it. The SME is the standard
 // error of that bin's mean voltage across the kept trials (their standard
 // deviation over the square root of their number): the smaller it is, the
 // less the average would move with other trials. It falls with more trials
@@ -91,8 +95,8 @@ type erpShape struct {
 	from, to int       // the ERP's rows in the stretch, to inclusive
 	baseline int       // rows from `from` up to and including the marker
 	kernel   []float64 // odd length, symmetric
-	bins     []int     // per ERP sample: its SME bin, from 0
-	numBins  int
+	// The SME windows: per window, its first and last ERP sample, inclusive.
+	binFirst, binLast []int
 }
 
 // erpTrial filters, cuts and baselines one sensor of one stored trial into
@@ -172,17 +176,13 @@ func averageERP(rows []voltageRow, sh erpShape, reject float64) []erpLabelJSON {
 	}
 	byLabel := map[string]*sums{}
 	trial := make([]float64, samples)
-	binMean := make([]float64, sh.numBins)
-	binCount := make([]int, sh.numBins)
-	for i := range trial {
-		binCount[sh.bins[i]]++
-	}
+	numBins := len(sh.binFirst)
 	for _, row := range rows {
 		a := byLabel[row.label]
 		if a == nil {
 			a = &sums{
 				good: make([]int, sh.channels), total: make([]float64, samples*sh.channels),
-				binSum: make([]float64, sh.numBins*sh.channels), binSum2: make([]float64, sh.numBins*sh.channels),
+				binSum: make([]float64, numBins*sh.channels), binSum2: make([]float64, numBins*sh.channels),
 			}
 			byLabel[row.label] = a
 		}
@@ -193,13 +193,15 @@ func averageERP(rows []voltageRow, sh erpShape, reject float64) []erpLabelJSON {
 				continue
 			}
 			a.good[c]++
-			clear(binMean)
 			for i, v := range trial {
 				a.total[i*sh.channels+c] += v
-				binMean[sh.bins[i]] += v
 			}
-			for b, v := range binMean {
-				v /= float64(binCount[b])
+			for b := range numBins {
+				var v float64
+				for i := sh.binFirst[b]; i <= sh.binLast[b]; i++ {
+					v += trial[i]
+				}
+				v /= float64(sh.binLast[b] - sh.binFirst[b] + 1)
 				a.binSum[b*sh.channels+c] += v
 				a.binSum2[b*sh.channels+c] += v * v
 			}
@@ -231,17 +233,45 @@ func averageERP(rows []voltageRow, sh erpShape, reject float64) []erpLabelJSON {
 	return out
 }
 
-// binsOf puts each ERP sample time into a 100 ms bin counted from the first
-// time; the last sample (exactly at the window's end) joins the last bin.
-// Returns each sample's bin and the number of bins.
+// smeWindows lays out the SME windows the way ERPLAB's make_DQ_spec does by
+// default: 100 ms long, starting at the marker and every 100 ms before and
+// after it within the ERP; if the last one runs past the end, it is dropped.
+// Each window's start and end are then the samples nearest to those times
+// (the first, on a tie), as in ERPLAB's sme_analytic, and both are included.
+// Returns each window's start in seconds and its first and last sample.
 // Used by: getERP.
-func binsOf(times []float64) ([]int, int) {
-	n := max(1, int(math.Round((times[len(times)-1]-times[0])/erpBinSeconds)))
-	bins := make([]int, len(times))
-	for i, t := range times {
-		bins[i] = min(int(math.Floor((t-times[0])/erpBinSeconds+1e-9)), n-1)
+func smeWindows(times []float64) (starts []float64, first, last []int) {
+	const eps = 1e-9
+	lo, hi := times[0], times[len(times)-1]
+	if lo < 0 && hi > 0 {
+		for t := 0.0; t >= lo-eps; t -= erpBinSeconds {
+			starts = append([]float64{t}, starts...)
+		}
+		for t := erpBinSeconds; t <= hi+eps; t += erpBinSeconds {
+			starts = append(starts, t)
+		}
+	} else {
+		for t := lo; t <= hi+eps; t += erpBinSeconds {
+			starts = append(starts, t)
+		}
 	}
-	return bins, n
+	if len(starts) > 0 && starts[len(starts)-1]+erpBinSeconds > hi+eps {
+		starts = starts[:len(starts)-1]
+	}
+	nearest := func(t float64) int {
+		best := 0
+		for i, x := range times {
+			if math.Abs(x-t) < math.Abs(times[best]-t)-eps {
+				best = i
+			}
+		}
+		return best
+	}
+	for _, s := range starts {
+		first = append(first, nearest(s))
+		last = append(last, nearest(s+erpBinSeconds))
+	}
+	return starts, first, last
 }
 
 // getERP handles GET /sessions/{id}/erp?reject=100: the ERP of each marker
@@ -258,31 +288,45 @@ func (a *api) getERP(w http.ResponseWriter, r *http.Request) {
 		}
 		reject = v
 	}
-	id := r.PathValue("id")
-	var rate float64
-	var names []string
-	err := a.db.QueryRow(r.Context(), `SELECT sample_rate_hz, channel_names FROM sessions WHERE id = $1`, id).Scan(&rate, &names)
+	out, err := a.computeERP(r.Context(), r.PathValue("id"), reject)
 	switch {
-	case errors.Is(err, pgx.ErrNoRows):
+	case errors.Is(err, errNoSession):
 		writeError(w, http.StatusNotFound, "no such session")
-		return
 	case err != nil:
 		serverError(w, r, err)
-		return
+	default:
+		writeJSON(w, http.StatusOK, out)
+	}
+}
+
+// errNoSession is what computeERP (and sessionFacts) return for an unknown session.
+var errNoSession = errors.New("no such session")
+
+// computeERP builds the ERP of each marker label from the trials stored so
+// far, with trials over reject µV peak-to-peak left out per sensor (0 keeps
+// every trial that is not flat). It returns errNoSession for an unknown session.
+// Used by: getERP, sessionFacts (summary.go).
+func (a *api) computeERP(ctx context.Context, id string, reject float64) (erpJSON, error) {
+	var rate float64
+	var names []string
+	err := a.db.QueryRow(ctx, `SELECT sample_rate_hz, channel_names FROM sessions WHERE id = $1`, id).Scan(&rate, &names)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return erpJSON{}, errNoSession
+	case err != nil:
+		return erpJSON{}, err
 	}
 
 	out := erpJSON{Times: []float64{}, LowpassHz: erpLowpassHz, Reject: reject, Bins: []float64{}, Labels: []erpLabelJSON{}}
 	kernel := lowpassKernel(rate, erpLowpassHz)
 	if kernel == nil {
-		writeJSON(w, http.StatusOK, out) // a rate too low for a 30 Hz filter: no ERP
-		return
+		return out, nil // a rate too low for a 30 Hz filter: no ERP
 	}
-	rows, err := a.db.Query(r.Context(), `
+	rows, err := a.db.Query(ctx, `
 		SELECT label, voltage_samples, voltage_pre, voltage
 		FROM epochs WHERE session_id = $1 AND voltage_samples > 0 ORDER BY marker_sample`, id)
 	if err != nil {
-		serverError(w, r, err)
-		return
+		return erpJSON{}, err
 	}
 	defer rows.Close()
 	var trials []voltageRow
@@ -292,8 +336,7 @@ func (a *api) getERP(w http.ResponseWriter, r *http.Request) {
 		var t voltageRow
 		var n, pre int
 		if err := rows.Scan(&t.label, &n, &pre, &t.voltage); err != nil {
-			serverError(w, r, err)
-			return
+			return erpJSON{}, err
 		}
 		if len(trials) == 0 {
 			// The first trial sets the shape; every trial of a session has the same.
@@ -314,20 +357,17 @@ func (a *api) getERP(w http.ResponseWriter, r *http.Request) {
 		trials = append(trials, t)
 	}
 	if err := rows.Err(); err != nil {
-		serverError(w, r, err)
-		return
+		return erpJSON{}, err
 	}
 	if len(trials) == 0 {
-		writeJSON(w, http.StatusOK, out)
-		return
+		return out, nil
 	}
 	for row := sh.from; row <= sh.to; row++ {
 		out.Times = append(out.Times, float64(row-sh.pre)/rate)
 	}
-	sh.bins, sh.numBins = binsOf(out.Times)
-	for b := 0; b < sh.numBins; b++ {
-		out.Bins = append(out.Bins, out.Times[0]+float64(b)*erpBinSeconds)
-	}
+	var starts []float64
+	starts, sh.binFirst, sh.binLast = smeWindows(out.Times)
+	out.Bins = append(out.Bins, starts...)
 	out.Labels = averageERP(trials, sh, reject)
-	writeJSON(w, http.StatusOK, out)
+	return out, nil
 }

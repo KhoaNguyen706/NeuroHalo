@@ -28,7 +28,7 @@ export type ResponseLine = {
 
 const HEIGHT = 150;
 const M = { top: 10, right: 80, bottom: 22, left: 48 }; // margins around the plot, in pixels; labels go on the right
-const NOTE_RIGHT = 140; // the right margin when the labels carry a note
+const NOTE_RIGHT = 210; // the right margin when the labels carry a note
 const BAR_SPREAD = 4; // pixels between two lines' error bars at the same time
 const LABEL_GAP = 13; // least distance between two line labels, in pixels
 
@@ -36,12 +36,13 @@ const LABEL_GAP = 13; // least distance between two line labels, in pixels
 // grid at the top, zero and bottom of the scale, a vertical line at the
 // marker, and each line's label with its trial count at the right.
 // Used by: the session page.
-export default function ResponseChart({ title, times, lines, unit = "change", controls }: {
+export default function ResponseChart({ title, times, lines, unit = "change", controls, empty }: {
   title: string; // what the chart shows, e.g. "Alpha · C3 · change after the marker"
   times: number[]; // per point: seconds after the marker (negative before it)
   lines: ResponseLine[];
   unit?: "change" | "uV"; // a ratio minus 1, or microvolts
   controls?: ReactNode; // shown at the right of the title
+  empty?: string; // shown over the plot while no line has a value
 }) {
   const box = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(600);
@@ -117,6 +118,7 @@ export default function ResponseChart({ title, times, lines, unit = "change", co
         {controls}
       </figcaption>
       <div ref={box} className={styles.plot}>
+        {empty && !lines.some((l) => l.values.some(Number.isFinite)) && <p className={styles.empty}>{empty}</p>}
         <svg width={width} height={HEIGHT} role="img" aria-label={title}>
           {[yMin, 0, yMax].map((v) => (
             <g key={v}>

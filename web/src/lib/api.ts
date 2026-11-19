@@ -37,14 +37,26 @@ export type Session = {
   studyId: string; // "" when the session is in no study
   participant: string; // who was recorded, inside the study
   task: string; // what they did
+  visit: string; // which visit, when the participant is recorded on several; "" otherwise
 };
 
 // One study in the list. Returned by: api.studies. Used by: the studies page.
 export type Study = { id: string; name: string; createdAt: string; sessions: number };
 
-// One study with its sessions, ordered by participant, task and start time.
+// What a study knows about one participant, for participants.tsv.
+// Part of: StudyDetail. Returned by: api.setParticipant. Used by: the study page.
+export type Participant = { label: string; age: number | null; sex: "" | "M" | "F" | "O" };
+
+// One study with its sessions, ordered by participant, visit, task and start
+// time, and the participants something was entered for.
 // Returned by: api.study. Used by: the study page.
-export type StudyDetail = { id: string; name: string; createdAt: string; sessionList: Session[] };
+export type StudyDetail = {
+  id: string;
+  name: string;
+  createdAt: string;
+  sessionList: Session[];
+  participants: Participant[];
+};
 
 // BIDS_LABEL is what a participant or task may be: letters and digits only,
 // because they become part of the file names. The api checks the same rule.
@@ -122,6 +134,31 @@ export type Replay = {
   createdAt: string;
 };
 
+// One live session on the overview: how long it has run, whether data is
+// arriving, and what makes it less usable. Returned by: api.live.
+// Used by: the live overview page.
+export type LiveRow = {
+  session: Session;
+  study: string; // the study's name, "" when not filed
+  seconds: number; // signal processed so far; 0 until the api has seen a frame
+  lastFrameMs: number; // since the newest frame arrived; -1 when none has yet
+  stalled: boolean; // no frame for over 3 s
+  bad: string[]; // sensors marked bad now
+  trials: number; // markers so far
+  eye: number; // eye movements so far
+  muscle: number; // stretches of muscle activity so far
+};
+
+// A session's written summary: whether the recording is usable and what to
+// do next, written by Claude from the session's measured facts.
+// Returned by: api.summary, api.writeSummary. Used by: SummaryPanel.
+export type Summary = {
+  body: string;
+  model: string;
+  createdAt: string;
+  final: boolean; // written after the session ended, so it is stored
+};
+
 // A built-in sample. Returned by: api.samples. Used by: the home page.
 export type Sample = { name: string; title: string; description: string };
 
@@ -192,6 +229,14 @@ function send<T>(method: string, path: string, body: unknown): Promise<T> {
 export const api = {
   sessions: () => call<Session[]>("/sessions"),
   session: (id: string) => call<Session>(`/sessions/${enc(id)}`),
+  // summary returns the stored summary; ApiError 404 when there is none. Free.
+  summary: (id: string) => call<Summary>(`/sessions/${enc(id)}/summary`),
+  // writeSummary asks Claude for a summary (one API call, unless one is
+  // stored and fresh is false).
+  writeSummary: (id: string, fresh = false) =>
+    call<Summary>(`/sessions/${enc(id)}/summary${fresh ? "?fresh=1" : ""}`, { method: "POST" }),
+  // live returns every live session with its data-quality summary.
+  live: () => call<LiveRow[]>("/live"),
   // deleteSession removes an ended session and everything stored for it.
   deleteSession: (id: string) => call<{ deleted: string }>(`/sessions/${enc(id)}`, { method: "DELETE" }),
   events: (id: string) => call<StoredEvent[]>(`/sessions/${enc(id)}/events`),
@@ -229,10 +274,13 @@ export const api = {
   createStudy: (name: string) => send<{ id: string }>("POST", "/studies", { name }),
   // deleteStudy removes a study; its sessions stay, untagged.
   deleteStudy: (id: string) => call<{ deleted: string }>(`/studies/${enc(id)}`, { method: "DELETE" }),
-  // setStudy files a session in a study with its participant and task, or
-  // takes it out of its study when studyId is "".
-  setStudy: (sessionId: string, studyId: string, participant = "", task = "") =>
-    send<Session>("PUT", `/sessions/${enc(sessionId)}/study`, { studyId, participant, task }),
+  // setStudy files a session in a study with its participant, task and
+  // (optional) visit, or takes it out of its study when studyId is "".
+  setStudy: (sessionId: string, studyId: string, participant = "", task = "", visit = "") =>
+    send<Session>("PUT", `/sessions/${enc(sessionId)}/study`, { studyId, participant, task, visit }),
+  // setParticipant stores a participant's age and sex for participants.tsv.
+  setParticipant: (studyId: string, label: string, age: number | null, sex: Participant["sex"]) =>
+    send<Participant>("PUT", `/studies/${enc(studyId)}/participants/${enc(label)}`, { age, sex }),
 };
 
 // bidsUrl is the download address of a study as a BIDS dataset (a zip). A

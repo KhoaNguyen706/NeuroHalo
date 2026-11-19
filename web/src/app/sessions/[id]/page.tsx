@@ -3,7 +3,7 @@
 // The session page: the 3D head with a band strength chart under it, and a
 // rail with the data quality, a band selector, toggles for signal correlation,
 // the flat sensor map and (when the session has markers) the averaged
-// response and the ERP, the event list, the CSV exports and the recording download. While the session is live, frames
+// response and the ERP, the written summary, the event list, the CSV exports and the recording download. While the session is live, frames
 // stream in over the WebSocket. Once it has ended, the page shows the stored
 // 10-second averages, with a playhead on the chart to move through them.
 
@@ -24,6 +24,8 @@ import {
 } from "@/lib/api";
 import { exportAverages, exportEvents } from "@/lib/export";
 import { change, clock, parseClock, percent, sessionName } from "@/lib/format";
+import { trialsStillNeeded } from "@/lib/sme";
+import SummaryPanel from "@/components/SummaryPanel";
 import { groupChannels, REGIONS } from "@/lib/regions";
 import styles from "./page.module.css";
 
@@ -75,6 +77,11 @@ type ChartMode = (typeof CHART_MODES)[number][0];
 // The ERP's rejection choices, in µV peak-to-peak; 0 keeps every trial.
 // The labels are what the chart's header shows.
 const REJECTS: [number, string][] = [[100, "100 µV"], [200, "200 µV"], [0, "Keep all"]];
+// The SME an ERP line should reach, in µV; 0 sets no target. Each line then
+// says how many more trials it needs to get there.
+// The length of each SME window the api reports, in seconds (erpBinSeconds in api/erp.go).
+const SME_WINDOW_S = 0.1;
+const TARGETS: [number, string][] =[[1, "±1"], [2, "±2"], [5, "±5 µV"], [0, "None"]];
 // The ERP's sensor when none is highlighted: the top of the head, where
 // most responses to a cue are visible.
 const ERP_DEFAULT = "Cz";
@@ -122,24 +129,32 @@ function meanOf(power: number[], channels: number[] | null): number {
 }
 
 // erpQuality turns one ERP line's SMEs into error bars at the middle of each
-// 100 ms bin, around the bin's mean voltage, and a note "±12 µV": the root
+// 100 ms window, around the window's mean voltage (both end samples included,
+// as the api computes it), and a note "±12 µV": the root
 // mean square of the SMEs of the bins after the marker. Bins with fewer than
-// 2 trials have no SME and get neither.
+// 2 trials have no SME and get neither. With a target SME (above 0) the note
+// goes on with the trials still needed to reach it: "±12 µV · 140 more", or
+// "enough" once it is reached.
 // Used by: SessionView (the ERP lines).
-function erpQuality(erp: Erp, l: LabelErp, c: number, channels: number) {
+function erpQuality(erp: Erp, l: LabelErp, c: number, channels: number, target: number) {
   const bars: { t: number; lo: number; hi: number }[] = [];
   let sum = 0;
   let n = 0;
   erp.bins.forEach((start, b) => {
     const sme = l.sme[b * channels + c];
     if (!(sme >= 0)) return;
-    const end = erp.bins[b + 1] ?? Infinity;
-    const inBin = erp.times.flatMap((t, i) => (t >= start - 1e-9 && t < end - 1e-9 ? [l.mean[i * channels + c]] : []));
+    // The api's window: start to start + 100 ms, both ends included.
+    const end = start + SME_WINDOW_S;
+    const inBin = erp.times.flatMap((t, i) => (t >= start - 1e-9 && t <= end + 1e-9 ? [l.mean[i * channels + c]] : []));
     const m = mean(inBin);
-    bars.push({ t: start + (erp.bins[1] - erp.bins[0]) / 2, lo: m - sme, hi: m + sme });
+    bars.push({ t: start + SME_WINDOW_S / 2, lo: m - sme, hi: m + sme });
     if (start >= -1e-9) { sum += sme * sme; n++; }
   });
-  return { bars, note: n ? `±${(Math.sqrt(sum / n)).toFixed(1)} µV` : undefined };
+  if (!n) return { bars, note: undefined };
+  const rms = Math.sqrt(sum / n);
+  const more = target > 0 ? trialsStillNeeded(l.good[c] ?? 0, l.trials, rms, target) : null;
+  const tail = more == null ? "" : more === 0 ? " · enough" : ` · ${more} more`;
+  return { bars, note: `±${rms.toFixed(1)} µV${tail}` };
 }
 
 // SessionPage shows the session named in the address. The key makes a move
@@ -172,7 +187,9 @@ function SessionView({ id }: { id: string }) {
   const [raw, setRaw] = useState(false); // "Raw signal" toggle
   const [response, setResponse] = useState(false); // "Averaged response" toggle
   const [erp, setErp] = useState(false); // "ERP" toggle
+  const [summary, setSummary] = useState(false); // "Summary" toggle
   const [reject, setReject] = useState(REJECTS[0][0]); // the ERP's rejection threshold
+  const [target, setTarget] = useState(TARGETS[1][0]); // the ERP's target SME
   const [chartMode, setChartMode] = useState<ChartMode>("all");
   const [popover, setPopover] = useState<Popover | null>(null);
   const [focus, setFocus] = useState<Focus | null>(null);
@@ -473,9 +490,9 @@ function SessionView({ id }: { id: string }) {
       of: l.trials,
       shade: SHADES[i % SHADES.length],
       values: erpData.times.map((_, t) => (l.good[erpChannel] ? l.mean[t * names.length + erpChannel] : NaN)),
-      ...erpQuality(erpData, l, erpChannel, names.length),
+      ...erpQuality(erpData, l, erpChannel, names.length, target),
     }));
-  }, [erpData, erpChannel, names]);
+  }, [erpData, erpChannel, names, target]);
 
   const marks: Mark[] = useMemo(
     () => events
@@ -535,8 +552,10 @@ function SessionView({ id }: { id: string }) {
     <main className={styles.page}>
       <div className={styles.main}>
       <div ref={stage} className={styles.stage}>
-        <HeadScene names={names} frameRef={viewRef} linksRef={live.linksRef} highlightRef={highlightRef}
-          onPick={onPick} onMiss={onMiss} />
+        <div className={map ? `${styles.scene} ${styles.sceneBeside}` : styles.scene}>
+          <HeadScene names={names} frameRef={viewRef} linksRef={live.linksRef} highlightRef={highlightRef}
+            onPick={onPick} onMiss={onMiss} />
+        </div>
 
         <div className={styles.info}>
           <span>{session ? sessionName(session) : id}</span>
@@ -610,21 +629,34 @@ function SessionView({ id }: { id: string }) {
           title={`${bandName} · ${highlight != null ? names[highlight] : "average of all sensors"} · change after the marker`}
           times={responses?.times ?? []}
           lines={responseLines}
+          empty={responses ? "No trial without a flat or noisy sensor yet" : "Loading…"}
         />
       )}
       {erp && hasMarkers && (
         <ResponseChart
-          title={`ERP · ${names[erpChannel] ?? ""} · ${reject ? `trials over ${reject} µV left out` : "all trials"}`}
+          title={`ERP · ${names[erpChannel] ?? ""} · ${reject ? `trials over ${reject} µV left out` : "all trials"}${target ? ` · trials needed for SME ±${target} µV` : ""}`}
           times={erpData?.times ?? []}
           lines={erpLines}
           unit="uV"
+          empty={!erpData ? "Loading…" : reject
+            ? `No trial under ${reject} µV at ${names[erpChannel] ?? "this sensor"} yet. Try ${reject < 200 ? "200 µV" : "Keep all"}`
+            : "No trials yet"}
           controls={
-            <div className={styles.modes} role="group" aria-label="Rejection">
-              {REJECTS.map(([value, label]) => (
-                <button key={value} type="button" aria-pressed={reject === value} onClick={() => setReject(value)}>
-                  {label}
-                </button>
-              ))}
+            <div className={styles.controlGroups}>
+              <div className={styles.modes} role="group" aria-label="Rejection">
+                {REJECTS.map(([value, label]) => (
+                  <button key={value} type="button" aria-pressed={reject === value} onClick={() => setReject(value)}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <div className={styles.modes} role="group" aria-label="Target SME">
+                {TARGETS.map(([value, label]) => (
+                  <button key={value} type="button" aria-pressed={target === value} onClick={() => setTarget(value)}>
+                    {label}
+                  </button>
+                ))}
+              </div>
             </div>
           }
         />
@@ -632,6 +664,7 @@ function SessionView({ id }: { id: string }) {
       {raw && isLive && session && (
         <RawTraces rawRef={live.rawRef} frameRef={viewRef} names={names} rate={session.sampleRateHz} />
       )}
+      {summary && <SummaryPanel sessionId={id} />}
       </div>
 
       <aside className={styles.rail}>
@@ -683,6 +716,10 @@ function SessionView({ id }: { id: string }) {
             ERP
           </button>
         )}
+
+        <button type="button" className={styles.toggle} aria-pressed={summary} onClick={() => setSummary((on) => !on)}>
+          Summary
+        </button>
 
         {/* Only a session with a stored recording behind it can be replayed. */}
         {ended && offset != null && (

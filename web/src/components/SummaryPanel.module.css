@@ -1,0 +1,60 @@
+/* The written summary under the charts: the same frame and type sizes as the
+   charts (12px header, hairline on top), the text itself at reading size. */
+
+.panel {
+  margin: 0;
+  padding: 8px 18px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 6px;
+}
+
+.title {
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+.write {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: var(--small);
+  cursor: pointer;
+}
+
+.write:hover {
+  color: var(--ink);
+}
+
+.write:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.body {
+  margin: 0;
+  max-width: 72ch;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--ink);
+  white-space: pre-line; /* keep the paragraphs Claude wrote */
+}
+
+.note,
+.error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+.error {
+  color: var(--bad);
+}

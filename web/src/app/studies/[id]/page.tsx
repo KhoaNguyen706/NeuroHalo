@@ -7,20 +7,25 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import ThemeToggle from "@/components/ThemeToggle";
-import { api, BIDS_LABEL, bidsUrl, type Session, type StudyDetail } from "@/lib/api";
+import { api, BIDS_LABEL, bidsUrl, type Participant, type Session, type StudyDetail } from "@/lib/api";
 import { clock, duration, sessionName } from "@/lib/format";
 import styles from "../studies.module.css";
 
+// SEXES are the choices for a participant's sex; "" is not given.
+const SEXES: [Participant["sex"], string][] = [["", "–"], ["F", "F"], ["M", "M"], ["O", "Other"]];
+
 // bidsNames gives each session the file name it gets in the BIDS download,
-// e.g. "sub-01_task-fists_run-2", or null when its recording is not ready and
-// it will be left out. Runs are numbered the way the api numbers them: only
-// when a participant has more than one exported session of a task, in the
-// order they started.
+// e.g. "sub-01_ses-pre_task-fists_run-2", or null when it will be left out:
+// its recording is not ready, or it has no visit while other sessions of the
+// same participant have one. Runs are numbered the way the api numbers them:
+// only when a participant has more than one exported session of a task in a
+// visit, in the order they started.
 function bidsNames(sessions: Session[]): Map<string, string | null> {
+  const visited = new Set(sessions.filter((s) => s.visit).map((s) => s.participant));
   const groups = new Map<string, Session[]>();
   for (const s of sessions) {
-    if (s.recording?.status !== "ready") continue;
-    const key = `${s.participant}\t${s.task}`;
+    if (s.recording?.status !== "ready" || (!s.visit && visited.has(s.participant))) continue;
+    const key = `${s.participant}\t${s.visit}\t${s.task}`;
     groups.set(key, [...(groups.get(key) ?? []), s]);
   }
   const names = new Map<string, string | null>(sessions.map((s) => [s.id, null]));
@@ -28,7 +33,8 @@ function bidsNames(sessions: Session[]): Map<string, string | null> {
     group.sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
     group.forEach((s, i) => {
       const run = group.length > 1 ? `_run-${i + 1}` : "";
-      names.set(s.id, `sub-${s.participant}_task-${s.task}${run}`);
+      const ses = s.visit ? `_ses-${s.visit}` : "";
+      names.set(s.id, `sub-${s.participant}${ses}_task-${s.task}${run}`);
     });
   }
   return names;
@@ -61,6 +67,7 @@ export default function StudyPage() {
   const [pick, setPick] = useState("");
   const [participant, setParticipant] = useState("");
   const [task, setTask] = useState("");
+  const [visit, setVisit] = useState("");
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState<string | null>(null); // a session ID, or "study"
 
@@ -87,20 +94,31 @@ export default function StudyPage() {
   // filled, so the next run of the same person is one click.
   const add = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!BIDS_LABEL.test(participant) || !BIDS_LABEL.test(task)) {
-      setError("Participant and task: letters and digits only. They become file names.");
+    if (!BIDS_LABEL.test(participant) || !BIDS_LABEL.test(task) || (visit !== "" && !BIDS_LABEL.test(visit))) {
+      setError("Participant, task and visit: letters and digits only. They become file names.");
       return;
     }
     setBusy(true);
     setError(null);
     try {
-      await api.setStudy(pick, id, participant, task);
+      await api.setStudy(pick, id, participant, task, visit);
       setPick("");
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
     setBusy(false);
+  };
+
+  // saveParticipant stores one participant's age and sex, then reloads.
+  const saveParticipant = async (label: string, age: number | null, sex: Participant["sex"]) => {
+    setError(null);
+    try {
+      await api.setParticipant(id, label, age, sex);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   };
 
   // remove takes a session out of the study; the session itself stays.
@@ -127,7 +145,11 @@ export default function StudyPage() {
   const sessions = study?.sessionList ?? [];
   const names = bidsNames(sessions);
   const ready = sessions.filter((s) => names.get(s.id) != null).length;
-  const people = new Set(sessions.map((s) => s.participant)).size;
+  const unfinished = sessions.filter((s) => s.recording?.status !== "ready").length;
+  const unvisited = sessions.length - ready - unfinished; // no visit, while the participant has others
+  const labels = [...new Set(sessions.map((s) => s.participant))].sort();
+  const people = labels.length;
+  const known = new Map((study?.participants ?? []).map((p) => [p.label, p]));
 
   return (
     <>
@@ -151,7 +173,9 @@ export default function StudyPage() {
       <p className="dim small">
         {sessions.length === 1 ? "1 session" : `${sessions.length} sessions`}
         {" · "}{people === 1 ? "1 participant" : `${people} participants`}
-        {ready < sessions.length && ` · ${sessions.length - ready} without a finished recording, left out of the download`}
+        {unfinished > 0 && ` · ${unfinished} without a finished recording`}
+        {unvisited > 0 && ` · ${unvisited} without a visit while the same participant has visits`}
+        {ready < sessions.length && ", left out of the download"}
       </p>
       {error && <p className="error" role="alert">{error}</p>}
 
@@ -163,12 +187,13 @@ export default function StudyPage() {
           <div className={styles.scroll}>
             <table className={styles.table}>
               <thead>
-                <tr><th>Participant</th><th>Task</th><th>File name</th><th>Session</th><th>Length</th><th>Recording</th><th /></tr>
+                <tr><th>Participant</th><th>Visit</th><th>Task</th><th>File name</th><th>Session</th><th>Length</th><th>Recording</th><th /></tr>
               </thead>
               <tbody>
                 {sessions.map((s) => (
                   <tr key={s.id}>
                     <td className="mono">{s.participant}</td>
+                    <td className="mono">{s.visit || <span className="dim">–</span>}</td>
                     <td className="mono">{s.task}</td>
                     <td className={styles.file}>{names.get(s.id) ?? <span className="dim">–</span>}</td>
                     <td className={styles.name}><Link href={`/sessions/${s.id}`}>{sessionName(s)}</Link></td>
@@ -189,6 +214,42 @@ export default function StudyPage() {
         )}
       </section>
 
+      {labels.length > 0 && (
+        <section className={styles.section}>
+          <h2>Participants</h2>
+          <div className={styles.scroll}>
+            <table className={styles.table}>
+              <thead><tr><th>Participant</th><th>Age</th><th>Sex</th></tr></thead>
+              <tbody>
+                {labels.map((label) => {
+                  const p = known.get(label) ?? { label, age: null, sex: "" as const };
+                  return (
+                    <tr key={label}>
+                      <td className="mono">{label}</td>
+                      <td>
+                        {/* Saved when the field is left; empty clears it. */}
+                        <input key={`${label}|${p.age}`} className={styles.cell} type="number" min={0} max={120}
+                          defaultValue={p.age ?? ""} aria-label={`Age of ${label}`}
+                          onBlur={(e) => {
+                            const age = e.target.value === "" ? null : Math.round(Number(e.target.value));
+                            if (age !== p.age) saveParticipant(label, age, p.sex);
+                          }} />
+                      </td>
+                      <td>
+                        <select className={styles.cell} value={p.sex} aria-label={`Sex of ${label}`}
+                          onChange={(e) => saveParticipant(label, p.age, e.target.value as Participant["sex"])}>
+                          {SEXES.map(([v, text]) => <option key={v} value={v}>{text}</option>)}
+                        </select>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+
       <section className={styles.section}>
         <h2>Add a session</h2>
         <form className={styles.form} onSubmit={add}>
@@ -205,6 +266,8 @@ export default function StudyPage() {
             placeholder="Participant" maxLength={32} aria-label="Participant" />
           <input className={styles.label} value={task} onChange={(e) => setTask(e.target.value)}
             placeholder="Task" maxLength={32} aria-label="Task" />
+          <input className={styles.label} value={visit} onChange={(e) => setVisit(e.target.value)}
+            placeholder="Visit (optional)" maxLength={32} aria-label="Visit, optional" />
           <button type="submit" disabled={busy || !pick || !participant || !task}>Add</button>
         </form>
       </section>

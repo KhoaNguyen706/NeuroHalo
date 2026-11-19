@@ -29,6 +29,20 @@ ALTER TABLE sessions ADD COLUMN IF NOT EXISTS study_id text REFERENCES studies(i
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS participant text NOT NULL DEFAULT '';
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS task text NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS sessions_study ON sessions (study_id) WHERE study_id IS NOT NULL;
+-- The visit a session belongs to, when a participant is recorded on several
+-- days (BIDS "ses-" level, e.g. "pre", "post", "1"); '' when there is only one.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS visit text NOT NULL DEFAULT '';
+
+-- What a study knows about each participant, for participants.tsv. A
+-- participant exists here only once something was entered; the label matches
+-- sessions.participant.
+CREATE TABLE IF NOT EXISTS participants (
+  study_id text NOT NULL REFERENCES studies(id) ON DELETE CASCADE,
+  label    text NOT NULL,
+  age      integer,                -- in years; NULL when not given
+  sex      text NOT NULL DEFAULT '', -- M, F, O, or '' when not given
+  PRIMARY KEY (study_id, label)
+);
 
 -- The raw signal of each session, kept by the recorder. While the session
 -- runs, its batches go to the object store as chunks (spool/<id>/...); once it

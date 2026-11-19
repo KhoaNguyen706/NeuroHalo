@@ -122,6 +122,8 @@ services:
       S3_SECRET_KEY: ${S3_SECRET_KEY:-neuro-dev-secret}
       S3_BUCKET: recordings
       WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
+      # Session summaries call Claude; without a key they are off and the rest works.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     ports:
       - "8080:8080"
     restart: unless-stopped
@@ -251,6 +253,23 @@ services:
     depends_on:
       gateway:
         condition: service_started
+
+  # MCP server for AI agents (Claude Code, Claude Desktop): reads the api over
+  # REST. Published on this machine only, at http://localhost:8090/mcp.
+  mcp:
+    build:
+      context: .
+      dockerfile: go.Dockerfile
+      args:
+        SERVICE: mcp
+    environment:
+      API_URL: http://api:8080
+      API_TOKEN: ${INGEST_TOKEN:-dev-token}
+    ports:
+      - "127.0.0.1:8090:8090"
+    restart: unless-stopped
+    depends_on:
+      - api
 
   # Terminal viewer, not part of the stack:  docker compose run --rm featuretail
   featuretail:
